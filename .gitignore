@@ -1,0 +1,12 @@
+# PyInstaller build output - large binaries, not for git
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# pip
+*.egg-info/
