@@ -1,6 +1,6 @@
 ﻿; GBrowser Inno Setup Script
 #define MyAppName "GBrowser"
-#define MyAppVersion "5.5"
+#define MyAppVersion "5.6"
 #define MyAppPublisher "Gorstak"
 #define MyAppExeName "GBrowser.exe"
 #define MyAppIcon "GBrowser.ico"

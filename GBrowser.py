@@ -249,23 +249,38 @@ def _is_auth_url(url: str) -> bool:
     return any(auth in url_lower for auth in AUTH_DOMAINS)
 
 
+# Lookup caches to avoid repeated subdomain walks on hot paths (e.g. Discord)
+_whitelist_cache: dict[str, bool] = {}
+_ad_domain_cache: dict[str, bool] = {}
+
+
 def _is_whitelisted(host: str) -> bool:
     """Check if host or any parent domain is whitelisted."""
     h = host.lower()
+    if h in _whitelist_cache:
+        return _whitelist_cache[h]
+    orig = h
     while "." in h:
         if h in AD_BLOCK_WHITELIST:
+            _whitelist_cache[orig] = True
             return True
         h = h[h.index(".") + 1:]
+    _whitelist_cache[orig] = False
     return False
 
 
 def _is_ad_domain(host: str) -> bool:
     """Check if host or any parent domain is in the blocked set."""
     h = host.lower()
+    if h in _ad_domain_cache:
+        return _ad_domain_cache[h]
+    orig = h
     while "." in h:
         if h in BLOCKED_AD_DOMAINS:
+            _ad_domain_cache[orig] = True
             return True
         h = h[h.index(".") + 1:]
+    _ad_domain_cache[orig] = False
     return False
 
 
@@ -902,20 +917,27 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
     def __init__(self):
         super().__init__()
         self.blocked_count = 0
-        self.page_is_whitelisted = False
 
     def interceptRequest(self, info):
-        url = info.requestUrl().toString().lower()
         try:
+            # Fast path: if the page (first-party) is whitelisted and request is same-site, skip entirely
+            first_party_url = info.firstPartyUrl()
+            if first_party_url and not first_party_url.isEmpty():
+                page_host = first_party_url.host().lower()
+                if page_host and _is_whitelisted(page_host):
+                    # Page is whitelisted — only block if request goes to a known ad domain
+                    req_host = info.requestUrl().host().lower()
+                    if req_host and _is_ad_domain(req_host):
+                        info.block(True)
+                        self.blocked_count += 1
+                    return
+
             host = info.requestUrl().host().lower()
             if _is_whitelisted(host):
                 return
 
             # Determine if this is a first-party (same-site) request.
-            # If the request target shares the same registrable domain as the page,
-            # skip pattern-based heuristic blocking — only block known ad domains.
             is_first_party = False
-            first_party_url = info.firstPartyUrl()
             if first_party_url and not first_party_url.isEmpty():
                 page_host = first_party_url.host().lower()
                 if page_host:
@@ -928,6 +950,7 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
 
             # Pattern-based heuristic blocking — only for third-party requests
             if not is_first_party:
+                url = info.requestUrl().toString().lower()
                 if any(p in url for p in ["/pagead/", "/adclick", "/aclk?", "/ptracking",
                        "/advert", "/sponsored", "/promotion", "/tracking/", "/analytics/",
                        "/collect?", "/beacon", "/pixel", "/imp?", "/impression"]):
@@ -2456,8 +2479,9 @@ def _resource_path(filename: str) -> str:
 
 
 if __name__ == "__main__":
-    # Fix QtWebEngine GPU/sandbox issues in virtualized environments
-    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox --disable-software-rasterizer")
+    # Note: GPU acceleration is enabled by default for best performance.
+    # If you encounter crashes in VMs or headless environments, uncomment:
+    # os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox")
 
     # Ensure exceptions aren't silently swallowed by Qt
     def _excepthook(exc_type, exc_value, exc_tb):
@@ -2468,7 +2492,7 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.5")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.6")
     except Exception:
         pass
 
