@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-set "VERSION=5.4"
+set "VERSION=5.5"
 
 echo Building GBrowser v%VERSION%...
 echo.
@@ -24,7 +24,7 @@ copy /Y GBrowser.ico dist\GBrowser\
 echo.
 echo Step 4: Building installer...
 REM Inno Setup outputs to releases\%VERSION%\ (defined in GBrowser.iss OutputDir)
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" GBrowser.iss
+"C:\Program Files\Inno Setup 7\ISCC.exe" GBrowser.iss
 if errorlevel 1 goto error
 
 echo.

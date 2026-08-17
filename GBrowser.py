@@ -269,6 +269,19 @@ def _is_ad_domain(host: str) -> bool:
     return False
 
 
+def _same_site(host1: str, host2: str) -> bool:
+    """Check if two hosts share the same registrable domain (e.g. sub.reddit.com and reddit.com)."""
+    def _base_domain(h: str) -> str:
+        parts = h.split(".")
+        # Handle common multi-part TLDs
+        if len(parts) >= 3 and parts[-1] in ("uk", "au", "jp", "br", "za", "nz", "kr", "in"):
+            return ".".join(parts[-3:])
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return h
+    return _base_domain(host1) == _base_domain(host2)
+
+
 def _is_ad_url(url: str) -> bool:
     """Check if a URL points to a known ad/tracking domain."""
     try:
@@ -897,15 +910,29 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
             host = info.requestUrl().host().lower()
             if _is_whitelisted(host):
                 return
+
+            # Determine if this is a first-party (same-site) request.
+            # If the request target shares the same registrable domain as the page,
+            # skip pattern-based heuristic blocking — only block known ad domains.
+            is_first_party = False
+            first_party_url = info.firstPartyUrl()
+            if first_party_url and not first_party_url.isEmpty():
+                page_host = first_party_url.host().lower()
+                if page_host:
+                    is_first_party = _same_site(host, page_host)
+
             if _is_ad_domain(host):
                 info.block(True)
                 self.blocked_count += 1
                 return
-            if any(p in url for p in ["/pagead/", "/adclick", "/aclk?", "/ptracking",
-                   "/advert", "/sponsored", "/promotion", "/tracking/", "/analytics/",
-                   "/collect?", "/beacon", "/pixel", "/imp?", "/impression"]):
-                info.block(True)
-                self.blocked_count += 1
+
+            # Pattern-based heuristic blocking — only for third-party requests
+            if not is_first_party:
+                if any(p in url for p in ["/pagead/", "/adclick", "/aclk?", "/ptracking",
+                       "/advert", "/sponsored", "/promotion", "/tracking/", "/analytics/",
+                       "/collect?", "/beacon", "/pixel", "/imp?", "/impression"]):
+                    info.block(True)
+                    self.blocked_count += 1
         except Exception:
             pass
 
@@ -1397,6 +1424,7 @@ class Browser(QMainWindow):
         self._bookmarks = _load_bookmarks()
         self._history = _load_history()
         _load_blocklist_file(_resource_path("blocklist.txt"))
+        _load_blocklist_file(os.path.join("E:\\Gorstak\\GSecurity-Ad-Shield", "blocklist.txt"))
         self._build_cached_main_world_js()  # Rebuild after blocklist loaded
 
         # Show search engine picker on first launch
@@ -2440,7 +2468,7 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.4")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.5")
     except Exception:
         pass
 
