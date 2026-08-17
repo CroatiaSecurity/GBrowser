@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.6-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-5.7-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.13+-green?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/engine-Chromium%20(QtWebEngine)-orange?style=flat-square" alt="Engine">
   <img src="https://img.shields.io/badge/license-proprietary-red?style=flat-square" alt="License">
@@ -136,7 +136,7 @@ build.bat
 This will:
 1. Install dependencies
 2. Build with PyInstaller (`--onedir --windowed`)
-3. Package with Inno Setup into `releases/5.6/GBrowser-5.6-Setup.exe`
+3. Package with Inno Setup into `releases/5.7/GBrowser-5.7-Setup.exe`
 
 > ⚙️ Requires [PyInstaller](https://pyinstaller.org/) and [Inno Setup 7](https://jrsoftware.org/isinfo.php) to be installed.
 

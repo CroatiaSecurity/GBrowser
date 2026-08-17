@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-set "VERSION=5.6"
+set "VERSION=5.7"
 
 echo Building GBrowser v%VERSION%...
 echo.

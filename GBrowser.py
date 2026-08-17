@@ -3,6 +3,18 @@
 # Logic-matched to Ceprkac: OAuth popups, downloads, custom tab strip, auth callbacks
 import sys
 import os
+
+# Chromium reads this once, at the first QtWebEngine import. Setting it later
+# (in __main__) is too late and Google still sees the QtWebEngine Client Hint
+# → "This browser or app may not be secure".
+_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+if "UserAgentClientHint" not in _flags:
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+        f"{_flags} --disable-features=UserAgentClientHint,AutomationControlled,"
+        "WebAuthentication,WebAuthenticationCable,WebAuthenticationHybridTransport "
+        "--disable-blink-features=AutomationControlled,WebAuthentication"
+    ).strip()
+
 import json
 import csv
 import re
@@ -88,6 +100,10 @@ BLOCKED_AD_DOMAINS: set[str] = {
     "doubleclick.net","googleadservices.com","googlesyndication.com","adservice.google.com",
     "ads.google.com","google-analytics.com","googletagmanager.com","googletagservices.com",
     "pagead2.googlesyndication.com","pagead2.googleadservices.com",
+    "adtrafficquality.google","ep1.adtrafficquality.google","ep2.adtrafficquality.google",
+    "fundingchoicesmessages.google.com","imasdk.googleapis.com",
+    "gemius.pl","gemius.com","hit.gemius.pl",
+    "stroeer.com","stroeerdigitalgroup.de",
     # Major ad networks
     "adnxs.com","taboola.com","outbrain.com","criteo.com","scorecardresearch.com","pubmatic.com",
     "rubiconproject.com","quantserve.com","quantcast.com","omniture.com","comscore.com",
@@ -193,14 +209,17 @@ AD_BLOCK_WHITELIST: set[str] = {
     "discord.com","discordapp.com","discord.gg","discord.media",
     "apple.com","icloud.com","ebay.com","paypal.com","mediafire.com",
     # Auth/OAuth providers
+    # Do NOT whitelist google.com itself — that also allows ads.google.com /
+    # adservice.google.com (parent-domain walk) and lets GPT ads through on
+    # news sites. First-party requests on google.com are already allowed.
     "accounts.google.com","accounts.youtube.com","myaccount.google.com",
-    "google.com","www.google.com","google.hr","google.co.uk",
     "youtube.com","www.youtube.com",
     "login.microsoftonline.com","login.live.com","login.microsoft.com",
     "appleid.apple.com","idmsa.apple.com",
     "github.com","auth0.com","okta.com",
     "apis.google.com","ssl.gstatic.com",
     "pay.google.com","payments.google.com",
+    "redditstatic.com",
     "gog.com","auth.gog.com","login.gog.com",
     "suno.com","suno.ai","clerk.suno.com",
     # AI services
@@ -249,17 +268,64 @@ def _is_auth_url(url: str) -> bool:
     return any(auth in url_lower for auth in AUTH_DOMAINS)
 
 
+def _to_qurl(url: str) -> QUrl:
+    """Turn a bookmark, address-bar, or popup string into a navigable QUrl."""
+    text = (url or "").strip()
+    if not text:
+        return QUrl("about:blank")
+    lowered = text.lower()
+    if lowered in ("about:blank", "about:srcdoc"):
+        return QUrl(text)
+    q = QUrl.fromUserInput(text)
+    # fromUserInput adds http:// for bare hosts; prefer https unless the user typed http
+    if q.isValid() and q.scheme() == "http" and not lowered.startswith("http:"):
+        q.setScheme("https")
+    if q.isValid() and q.scheme():
+        return q
+    return QUrl("about:blank")
+
+
+def _is_idp_challenge_url(url: str) -> bool:
+    """True on 2FA / OAuth-consent pages where autofill must not run."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    idp_hosts = (
+        "accounts.google.com", "accounts.youtube.com",
+        "login.microsoftonline.com", "login.live.com", "login.microsoft.com",
+        "appleid.apple.com", "idmsa.apple.com",
+    )
+    if not any(host == h or host.endswith("." + h) for h in idp_hosts):
+        return False
+    if "/pwd" in path or "/password" in path or "/identifier" in path:
+        return False
+    return any(p in path for p in (
+        "/challenge", "/signin/oauth", "/oauth", "/consent",
+        "/speedbump", "/rejected", "/signin/continue", "/unknownerror",
+    ))
+
+
 # Lookup caches to avoid repeated subdomain walks on hot paths (e.g. Discord)
 _whitelist_cache: dict[str, bool] = {}
 _ad_domain_cache: dict[str, bool] = {}
 
 
 def _is_whitelisted(host: str) -> bool:
-    """Check if host or any parent domain is whitelisted."""
+    """Check if host or any parent domain is whitelisted.
+
+    A known ad host (or a child of one) is never allowed just because a
+    parent like google.com is on the allow list.
+    """
     h = host.lower()
     if h in _whitelist_cache:
         return _whitelist_cache[h]
     orig = h
+    if orig not in AD_BLOCK_WHITELIST and _is_ad_domain(orig):
+        _whitelist_cache[orig] = False
+        return False
     while "." in h:
         if h in AD_BLOCK_WHITELIST:
             _whitelist_cache[orig] = True
@@ -307,9 +373,6 @@ def _is_ad_url(url: str) -> bool:
             return False
         if _is_ad_domain(host):
             return True
-        if any(p in url for p in ["/pagead/", "/adclick", "/aclk?",
-               "googleadservices.com", "doubleclick.net", "googlesyndication.com"]):
-            return True
     except Exception:
         pass
     return False
@@ -320,13 +383,141 @@ def _load_blocklist_file(path: str):
     if not os.path.exists(path):
         return 0
     count = 0
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
-            domain = line.strip()
+            domain = line.strip().lstrip("\ufeff")
             if domain and not domain.startswith("#") and "." in domain:
-                BLOCKED_AD_DOMAINS.add(domain)
+                BLOCKED_AD_DOMAINS.add(domain.lower())
                 count += 1
+    _ad_domain_cache.clear()
     return count
+
+
+# Path snippets from GSecurity rules.json (e.g. /pagead.js, adsbygoogle.js)
+AD_PATH_FILTERS: list[str] = []
+
+
+def _find_gsecurity_dir() -> str:
+    """Locate the GSecurity-Ad-Shield tree (dev checkout or next to the exe)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join("E:\\", "Gorstak", "GSecurity-Ad-Shield"),
+        os.path.join(here, "GSecurity-Ad-Shield"),
+        os.path.join(here, "..", "GSecurity-Ad-Shield"),
+        os.path.join(os.path.dirname(sys.executable), "GSecurity-Ad-Shield"),
+        os.path.join(os.path.dirname(sys.executable), "..", "GSecurity-Ad-Shield"),
+    ]
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.insert(0, os.path.join(meipass, "GSecurity-Ad-Shield"))
+    for raw in candidates:
+        path = os.path.normpath(raw)
+        if os.path.isfile(os.path.join(path, "blocklist.txt")) or os.path.isfile(os.path.join(path, "main-world.js")):
+            return path
+    return ""
+
+
+def _host_from_url_filter(url_filter: str) -> str:
+    text = (url_filter or "").strip()
+    if text.startswith("||"):
+        host = text[2:].split("/")[0].split("^")[0].split("*")[0].lower()
+        if "." in host:
+            return host
+    return ""
+
+
+def _import_gsecurity(shield_dir: str) -> tuple[int, int]:
+    """Import GSecurity-Ad-Shield blocklist + declarativeNetRequest rules."""
+    if not shield_dir:
+        return 0, 0
+    domains = _load_blocklist_file(os.path.join(shield_dir, "blocklist.txt"))
+    rules_path = os.path.join(shield_dir, "rules.json")
+    rules = 0
+    if os.path.isfile(rules_path):
+        try:
+            with open(rules_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for rule in data:
+                    action = ((rule.get("action") or {}).get("type") or "").lower()
+                    url_filter = (rule.get("condition") or {}).get("urlFilter") or ""
+                    host = _host_from_url_filter(url_filter)
+                    if action == "allow" and host:
+                        AD_BLOCK_WHITELIST.add(host)
+                    elif action == "block" and host:
+                        BLOCKED_AD_DOMAINS.add(host)
+                        rules += 1
+                    elif action == "block" and url_filter and not url_filter.startswith("||"):
+                        snippet = url_filter.lower().lstrip("|")
+                        if len(snippet) >= 6 and snippet not in AD_PATH_FILTERS:
+                            AD_PATH_FILTERS.append(snippet)
+                            rules += 1
+        except Exception:
+            pass
+    _whitelist_cache.clear()
+    _ad_domain_cache.clear()
+    return domains, rules
+
+
+def _find_pac_dir() -> str:
+    """Locate the original Pac tree (BlockAds.pac + GSecurity.user.js)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join("E:\\", "Gorstak", "Pac"),
+        os.path.join(here, "Pac"),
+        os.path.join(here, "..", "Pac"),
+        os.path.join(os.path.dirname(sys.executable), "Pac"),
+        os.path.join(os.path.dirname(sys.executable), "..", "Pac"),
+    ]
+    for raw in candidates:
+        path = os.path.normpath(raw)
+        if os.path.isfile(os.path.join(path, "BlockAds.pac")):
+            return path
+    return ""
+
+
+def _import_pac(pac_dir: str) -> int:
+    """Import BlockAds.pac whitelist + blacklist into the interceptor sets.
+
+    GSecurity-Ad-Shield already carries the PAC regexes in main-world.js.
+    This adds the explicit PAC host lists. Skip a few PAC entries that are
+    whole consumer sites (amazon.co.uk) or would parent-match all of S3.
+    """
+    if not pac_dir:
+        return 0
+    pac_path = os.path.join(pac_dir, "BlockAds.pac")
+    if not os.path.isfile(pac_path):
+        return 0
+    try:
+        text = open(pac_path, "r", encoding="utf-8-sig", errors="ignore").read()
+    except Exception:
+        return 0
+    skip_hosts = {
+        "amazonaws.com", "amazon.ae", "amazon.cn", "amazon.co.uk",
+        "creative.ak.fbcdn.net",  # Facebook CDN, not an ad host
+    }
+    added = 0
+
+    def _js_string_list(src: str, var_name: str) -> list[str]:
+        m = re.search(rf"var\s+{re.escape(var_name)}\s*=\s*\[(.*?)\];", src, re.S)
+        if not m:
+            return []
+        return [s.lower() for s in re.findall(r'"([^"]+)"', m.group(1))]
+
+    for host in _js_string_list(text, "whitelist"):
+        if "." in host:
+            AD_BLOCK_WHITELIST.add(host)
+    for host in _js_string_list(text, "blacklist"):
+        if "." not in host or host in skip_hosts:
+            continue
+        if host.startswith("amazon.") and "advertising" not in host and "adsystem" not in host:
+            continue
+        BLOCKED_AD_DOMAINS.add(host)
+        added += 1
+    _whitelist_cache.clear()
+    _ad_domain_cache.clear()
+    return added
 
 
 # === PASSWORD MANAGER (Same logic as Ceprkac, with Fernet fallback) ===
@@ -695,6 +886,7 @@ class ChromeTab:
         self.load_progress: int = 0
         self.last_autofill_attempt: float = 0
         self.zoom_factor: float = 1.0
+        self.is_popup: bool = False
 
 
 class ChromeTabStrip(QWidget):
@@ -912,6 +1104,45 @@ class ChromeTabStrip(QWidget):
         self._drag_tab_index = -1
 
 
+def _chromium_major() -> str:
+    try:
+        from PyQt6.QtWebEngineCore import qWebEngineChromiumVersion
+        return (qWebEngineChromiumVersion() or "140").split(".")[0]
+    except Exception:
+        return "140"
+
+
+# qutebrowser #5182 / Falkon: Google rejects a Chrome UA from QtWebEngine
+# (it treats it as an embedded WebView). A Firefox UA skips that check.
+_FIREFOX_SIGNIN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
+    "Gecko/20100101 Firefox/140.0"
+)
+_FIREFOX_SIGNIN_UA_BYTES = _FIREFOX_SIGNIN_UA.encode("ascii")
+
+
+def _is_google_signin_host(host: str) -> bool:
+    h = (host or "").lower()
+    return (
+        h == "accounts.google.com" or h.endswith(".accounts.google.com")
+        or h == "accounts.youtube.com"
+        or h == "myaccount.google.com"
+    )
+
+
+def _apply_google_signin_ua(info) -> None:
+    """Use a Firefox UA on Google Sign-In so QtWebEngine is not rejected."""
+    try:
+        info.setHttpHeader(QByteArray(b"User-Agent"), QByteArray(_FIREFOX_SIGNIN_UA_BYTES))
+        # Firefox does not send these; a Chrome brand + Firefox UA is worse.
+        info.setHttpHeader(QByteArray(b"Sec-CH-UA"), QByteArray(b""))
+        info.setHttpHeader(QByteArray(b"Sec-CH-UA-Mobile"), QByteArray(b""))
+        info.setHttpHeader(QByteArray(b"Sec-CH-UA-Platform"), QByteArray(b""))
+        info.setHttpHeader(QByteArray(b"Sec-CH-UA-Full-Version-List"), QByteArray(b""))
+    except Exception:
+        pass
+
+
 # === AD BLOCKER INTERCEPTOR (Same logic as Ceprkac) ===
 class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
     def __init__(self):
@@ -920,42 +1151,47 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
 
     def interceptRequest(self, info):
         try:
-            # Fast path: if the page (first-party) is whitelisted and request is same-site, skip entirely
+            first_party_host = ""
             first_party_url = info.firstPartyUrl()
             if first_party_url and not first_party_url.isEmpty():
-                page_host = first_party_url.host().lower()
-                if page_host and _is_whitelisted(page_host):
-                    # Page is whitelisted — only block if request goes to a known ad domain
-                    req_host = info.requestUrl().host().lower()
-                    if req_host and _is_ad_domain(req_host):
-                        info.block(True)
-                        self.blocked_count += 1
-                    return
+                first_party_host = first_party_url.host().lower()
 
             host = info.requestUrl().host().lower()
+
+            if _is_google_signin_host(host) or _is_google_signin_host(first_party_host):
+                _apply_google_signin_ua(info)
+
+            # Never cancel a top-level navigation. Blocking the main document
+            # leaves the user on the previous page (usually the homepage).
+            if info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.MainFrame:
+                return
+
+            # Fast path: if the request target is whitelisted, always allow
             if _is_whitelisted(host):
                 return
 
-            # Determine if this is a first-party (same-site) request.
-            is_first_party = False
-            if first_party_url and not first_party_url.isEmpty():
-                page_host = first_party_url.host().lower()
-                if page_host:
-                    is_first_party = _same_site(host, page_host)
+            # Determine if this is a same-site (first-party) request
+            is_first_party = first_party_host and _same_site(host, first_party_host)
 
+            # Same-site requests are NEVER blocked — sites need their own
+            # subdomains for auth, APIs, telemetry, content delivery, etc.
+            if is_first_party:
+                return
+
+            # Third-party: block known ad domains
             if _is_ad_domain(host):
                 info.block(True)
                 self.blocked_count += 1
                 return
 
-            # Pattern-based heuristic blocking — only for third-party requests
-            if not is_first_party:
-                url = info.requestUrl().toString().lower()
-                if any(p in url for p in ["/pagead/", "/adclick", "/aclk?", "/ptracking",
-                       "/advert", "/sponsored", "/promotion", "/tracking/", "/analytics/",
-                       "/collect?", "/beacon", "/pixel", "/imp?", "/impression"]):
-                    info.block(True)
-                    self.blocked_count += 1
+            # GSecurity path rules (/pagead.js, adsbygoogle.js, …) — third-party only
+            if AD_PATH_FILTERS:
+                full = info.requestUrl().toString().lower()
+                for snippet in AD_PATH_FILTERS:
+                    if snippet in full:
+                        info.block(True)
+                        self.blocked_count += 1
+                        return
         except Exception:
             pass
 
@@ -971,33 +1207,34 @@ class BrowserPage(QWebEnginePage):
         url_str = url.toString()
         url_lower = url_str.lower()
 
-        # Check for ad URLs
-        if _is_ad_url(url_lower):
-            if self.browser_window:
-                self.browser_window._on_ad_blocked_navigation(self)
-            return False
-
-        # Check for auth URLs - allow them (for OAuth popups)
-        if _is_auth_url(url_lower):
+        # Never block main-frame navigations — the user or the page itself is navigating.
+        # Only block ad URLs in sub-frames (iframes loading ad content).
+        if is_main_frame:
+            self._last_url = url_str
             return True
+
+        # Reject ad iframes only. Do NOT goBack() — a news site like index.hr
+        # loads many ad frames, and going back would bounce to the previous
+        # page (usually the Google homepage).
+        if _is_ad_url(url_lower):
+            return False
 
         self._last_url = url_str
         return True
 
     def createWindow(self, window_type):
-        """Handle new window requests (like Ceprkac's NewWindowRequested)."""
+        """Load window.open() into a real tab so window.opener stays intact.
+
+        Do not use a separate QDialog WebEngine view — that renders black
+        and breaks Google/Reddit OAuth.
+        """
         if not self.browser_window:
             return None
-
-        # Get the URL being requested
-        # QtWebEngine doesn't give us the URL directly, we need to check the trigger
-        # For OAuth flows, we'll create a popup window
-        page = BrowserPage(self.profile(), browser_window=self.browser_window)
-
-        # Connect to detect the URL when it loads
-        page.urlChanged.connect(lambda url: self.browser_window._handle_new_window_url(page, url))
-
-        return page
+        tab = self.browser_window._add_new_tab(url="", load_url=False)
+        if not tab or not tab.web_view:
+            return None
+        tab.is_popup = True
+        return tab.web_view.page()
 
 
 # === AD ELEMENT HIDER JS (Same as Ceprkac) ===
@@ -1064,7 +1301,15 @@ AD_ELEMENT_HIDER_JS = r"""(function() {
         '[data-a-target="video-ad-label"]','.video-ad','.advertisement-banner',
         '[data-test-selector="ad-banner-default-id"]','.stream-display-ad',
         /* TikTok ads */
-        '[class*="DivAdBanner"]','[data-e2e="ad"]'
+        '[class*="DivAdBanner"]','[data-e2e="ad"]',
+        /* Croatian news portals (24sata, index.hr, …) */
+        'div[id^="div-gpt-ad"]','div[id^="google_ads_"]','div[id*="gpt-ad"]',
+        '.dfp-ad','.dfp_ad','.gpt-ad','.adSlot','.ad-slot','.AdSlot',
+        '.reklama','.oglas','[class*="Reklama"]','[id*="reklama"]',
+        '.js-ad','.js-ads','.js-gpt-ad','[data-ad-unit]','[data-google-query-id]',
+        '#billboard','.billboard-ad','.banner-holder','.bannerHolder',
+        'iframe[id^="google_ads"]','iframe[src*="adform"]','iframe[src*="gemius"]',
+        'iframe[src*="adtrafficquality"]'
     ].join(',') + '{display:none!important;height:0!important;min-height:0!important;overflow:hidden!important}';
     (document.head || document.documentElement).appendChild(css);
     var sels = [
@@ -1102,7 +1347,14 @@ AD_ELEMENT_HIDER_JS = r"""(function() {
         '[data-a-target="video-ad-label"]','.video-ad','.advertisement-banner',
         '[data-test-selector="ad-banner-default-id"]','.stream-display-ad',
         /* TikTok */
-        '[class*="DivAdBanner"]','[data-e2e="ad"]'
+        '[class*="DivAdBanner"]','[data-e2e="ad"]',
+        /* Croatian news portals */
+        'div[id^="div-gpt-ad"]','div[id^="google_ads_"]','div[id*="gpt-ad"]',
+        '.dfp-ad','.dfp_ad','.gpt-ad','.adSlot','.AdSlot',
+        '.reklama','.oglas','[class*="Reklama"]','[id*="reklama"]',
+        '.js-ad','.js-ads','.js-gpt-ad','[data-ad-unit]',
+        '#billboard','.billboard-ad','.banner-holder','.bannerHolder',
+        'iframe[src*="adform"]','iframe[src*="gemius"]','iframe[src*="adtrafficquality"]'
     ];
     function scrub() {
         for (var i = 0; i < sels.length; i++) {
@@ -1418,6 +1670,192 @@ class DownloadManagerDialog(QDialog):
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
 
+# Hide Qt/automation fingerprints that Google Sign-In uses to reject the browser.
+CHROME_COMPAT_JS = r"""
+(function(){
+  try { Object.defineProperty(navigator,'webdriver',{get:function(){return undefined;},configurable:true}); } catch(e) {}
+  try {
+    if (!window.chrome) {
+      window.chrome = { runtime: {}, loadTimes: function(){return {};}, csi: function(){return {};},
+                        app: { isInstalled: false } };
+    }
+  } catch(e) {}
+  try {
+    var brands = [
+      {brand: "Chromium", version: "131"},
+      {brand: "Google Chrome", version: "131"},
+      {brand: "Not_A Brand", version: "24"}
+    ];
+    var uaData = {
+      brands: brands,
+      mobile: false,
+      platform: "Windows",
+      getHighEntropyValues: function(hints) {
+        return Promise.resolve({
+          brands: brands,
+          mobile: false,
+          platform: "Windows",
+          platformVersion: "15.0.0",
+          architecture: "x86",
+          bitness: "64",
+          model: "",
+          uaFullVersion: "131.0.0.0",
+          fullVersionList: brands
+        });
+      },
+      toJSON: function(){ return {brands: brands, mobile: false, platform: "Windows"}; }
+    };
+    Object.defineProperty(navigator, 'userAgentData', {get: function(){return uaData;}, configurable: true});
+  } catch(e) {}
+})();
+"""
+
+
+# Kill passkey / WebAuthn prompts on every site (Google, Microsoft, GitHub, …).
+DISABLE_PASSKEY_JS = r"""
+(function(){
+  if (window.__gNoPasskey) return;
+  window.__gNoPasskey = 1;
+  try {
+    if (window.PublicKeyCredential) {
+      PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = function(){ return Promise.resolve(false); };
+      PublicKeyCredential.isConditionalMediationAvailable = function(){ return Promise.resolve(false); };
+      if (PublicKeyCredential.isExternalCTAP2SecurityKeySupported)
+        PublicKeyCredential.isExternalCTAP2SecurityKeySupported = function(){ return Promise.resolve(false); };
+    }
+  } catch(e) {}
+  try {
+    if (navigator.credentials) {
+      var origGet = navigator.credentials.get.bind(navigator.credentials);
+      var origCreate = navigator.credentials.create.bind(navigator.credentials);
+      navigator.credentials.get = function(opts){
+        if (opts && opts.publicKey)
+          return Promise.reject(new DOMException('The user attempted to use an authenticator that is not available.', 'NotAllowedError'));
+        return origGet(opts);
+      };
+      navigator.credentials.create = function(opts){
+        if (opts && opts.publicKey)
+          return Promise.reject(new DOMException('The user attempted to use an authenticator that is not available.', 'NotAllowedError'));
+        return origCreate(opts);
+      };
+    }
+  } catch(e) {}
+  function clickSkip(){
+    try {
+      var texts = ['not now','no thanks','skip','maybe later','use password','try another way',
+                   'use your password','cancel','dismiss','not now, thanks'];
+      var nodes = document.querySelectorAll('button, [role="button"], a, span, div[jsname]');
+      for (var i = 0; i < nodes.length; i++) {
+        var t = (nodes[i].innerText || nodes[i].textContent || '').replace(/\s+/g,' ').trim().toLowerCase();
+        if (!t || t.length > 40) continue;
+        if (texts.indexOf(t) < 0) continue;
+        var box = (nodes[i].closest('div,section,form,dialog') || document.body).innerText || '';
+        if (!/passkey|pass key|fingerprint|face id|windows hello|security key|skripta|pristupni klju/i.test(box))
+          continue;
+        nodes[i].click();
+        return;
+      }
+    } catch(e) {}
+  }
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', function(){ clickSkip(); setTimeout(clickSkip, 400); });
+  else { clickSkip(); setTimeout(clickSkip, 400); }
+  setInterval(clickSkip, 1500);
+})();
+"""
+
+
+# Full-screen ad popups leave a black veil after the iframe is blocked.
+GSEC_OVERLAY_CLEANUP_JS = r"""
+(function(){
+  var host = (location.hostname || '').toLowerCase();
+  if (/google\.|gstatic\.|youtube\.|googleapis\.|appleid\.|microsoftonline\.|live\.com|microsoft\.com/.test(host))
+    return;
+  if (window.__gsecOverlayClean) return;
+  window.__gsecOverlayClean = true;
+  function wipe(){
+    try{
+      var body = document.body;
+      if (!body) return;
+      var nodes = document.querySelectorAll('div,section,aside,dialog');
+      for (var i = 0; i < nodes.length; i++){
+        var el = nodes[i];
+        if (el.getAttribute('data-gsec-bait')) continue;
+        var st = window.getComputedStyle(el);
+        if (st.position !== 'fixed' && st.position !== 'sticky') continue;
+        var r = el.getBoundingClientRect();
+        if (r.width < innerWidth * 0.85 || r.height < innerHeight * 0.85) continue;
+        if (el.querySelector('video, input, textarea, [contenteditable="true"]')) continue;
+        var z = parseInt(st.zIndex, 10);
+        if (!isFinite(z) || z < 1000) continue;
+        var idc = ((el.id||'') + ' ' + (el.className||'')).toLowerCase();
+        var looksAd = /reklama|oglas|interstitial|prestitial|takeover|gpt-ad|adsbygoogle|ad-overlay|adoverlay/.test(idc);
+        var text = (el.innerText || '').replace(/\s+/g,' ').trim();
+        var frames = el.querySelectorAll('iframe');
+        var empty = text.length < 80;
+        if (looksAd || (empty && frames.length)) {
+          el.style.setProperty('display','none','important');
+          el.setAttribute('data-gsec-overlay','1');
+        }
+      }
+      if (document.querySelector('[data-gsec-overlay]')) {
+        body.style.removeProperty('overflow');
+        body.style.removeProperty('position');
+        document.documentElement.style.removeProperty('overflow');
+      }
+    }catch(e){}
+  }
+  wipe();
+  setTimeout(wipe, 200);
+  setTimeout(wipe, 800);
+  setTimeout(wipe, 2000);
+  setInterval(wipe, 2500);
+})();
+"""
+
+
+# Collapse reserved-height GPT/DFP slots (index.hr billboards etc.) after the
+# iframe is blocked — otherwise the page keeps a huge empty white band.
+GSEC_SLOT_COLLAPSE_JS = r"""
+(function(){
+  var h=(location.hostname||'').toLowerCase();
+  if(/accounts\.google|accounts\.youtube|appleid\.apple|login\.microsoft|login\.live/.test(h))return;
+  if(window.__gsecSlotCollapse)return;window.__gsecSlotCollapse=1;
+  var css=document.createElement('style');
+  css.textContent=[
+    'div[id^="div-gpt-ad"]','div[id*="gpt-ad"]','div[id^="google_ads_"]',
+    'iframe[id^="google_ads"]','iframe[id^="aswift"]','ins.adsbygoogle',
+    '[data-google-query-id]','.dfp-ad','.gpt-ad','.AdSlot','.adSlot',
+    '[id*="reklama"]','[class*="Reklama"]'
+  ].map(function(s){return s+'{display:none!important;height:0!important;min-height:0!important;max-height:0!important;margin:0!important;padding:0!important;overflow:hidden!important;border:0!important}';}).join('');
+  (document.head||document.documentElement).appendChild(css);
+  function collapse(){
+    try{
+      document.querySelectorAll('iframe[id^="google_ads"],iframe[id^="aswift"],ins.adsbygoogle,div[id^="div-gpt-ad"],[data-gsec-hidden]').forEach(function(el){
+        var p=el.parentElement,n=0;
+        while(p&&p!==document.body&&n<4){
+          var text=(p.innerText||'').replace(/\s+/g,' ').trim();
+          var mh=parseInt(getComputedStyle(p).minHeight,10)||0;
+          if(text.length<24&&(mh>=80||p.offsetHeight>=80)){
+            p.style.setProperty('display','none','important');
+            p.style.setProperty('min-height','0','important');
+            p.style.setProperty('height','0','important');
+            p.style.setProperty('margin','0','important');
+            p.style.setProperty('padding','0','important');
+          }
+          p=p.parentElement;n++;
+        }
+      });
+    }catch(e){}
+  }
+  collapse();
+  setTimeout(collapse,300);
+  setTimeout(collapse,1200);
+  setInterval(collapse,2500);
+})();
+"""
+
+
 # === MAIN BROWSER WINDOW (Logic-matched to Ceprkac) ===
 class Browser(QMainWindow):
     def __init__(self):
@@ -1436,9 +1874,46 @@ class Browser(QMainWindow):
         self._closed_tabs: list[str] = []  # Stack of closed tab URLs (max 20)
         self._cached_main_world_js: str = ""  # Cached blocker JS
         self._last_bookmark_hash: int = 0  # For incremental bookmark bar updates
+        self._gsec_dir: str = ""
         self._profile = QWebEngineProfile("GBrowserProfile", self)
+        # Real Chromium version, no QtWebEngine token. Combined with
+        # QTWEBENGINE_CHROMIUM_FLAGS (set before import) and spoofed
+        # Sec-CH-UA headers so Google does not reject the browser.
+        try:
+            raw_ua = QWebEngineProfile.defaultProfile().httpUserAgent() or ""
+            ua = re.sub(r"\s*QtWebEngine/\S+", "", raw_ua).strip()
+            ver = _chromium_major()
+            if not ua or "Chrome/" not in ua:
+                ua = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
+                )
+            self._profile.setHttpUserAgent(ua)
+        except Exception:
+            pass
+        self._profile.setPersistentStoragePath(os.path.join(CONFIG_DIR, "storage"))
+        self._profile.setCachePath(os.path.join(CONFIG_DIR, "cache"))
+        self._profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+        ws = self._profile.settings()
+        ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
+        ws.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+        ws.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+        ws.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+        try:
+            ws.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
+        except Exception:
+            pass
         self._profile.setUrlRequestInterceptor(self._ad_blocker)
         self._profile.downloadRequested.connect(self._on_download_requested)
+        self._install_chrome_compat_script()
+
+        self._gsec_dir = _find_gsecurity_dir()
+        _load_blocklist_file(_resource_path("blocklist.txt"))
+        _import_pac(_find_pac_dir())
+        _import_gsecurity(self._gsec_dir)
+        self._install_gsecurity_scripts()
 
         self._build_cached_main_world_js()
         self._init_ui()
@@ -1446,8 +1921,6 @@ class Browser(QMainWindow):
         self._load_initial_settings()
         self._bookmarks = _load_bookmarks()
         self._history = _load_history()
-        _load_blocklist_file(_resource_path("blocklist.txt"))
-        _load_blocklist_file(os.path.join("E:\\Gorstak\\GSecurity-Ad-Shield", "blocklist.txt"))
         self._build_cached_main_world_js()  # Rebuild after blocklist loaded
 
         # Show search engine picker on first launch
@@ -1476,8 +1949,12 @@ class Browser(QMainWindow):
             f"var b=new Set([{domain_list}]);"
             f"var wl=new Set(['{wl_domains}']);"
             "function isWl(h){while(h){if(wl.has(h))return 1;var i=h.indexOf('.');if(i<0)break;h=h.substr(i+1);}return 0};"
+            "function baseDom(h){var p=h.split('.');if(p.length>=3&&/^(uk|au|jp|br|za|nz|kr|in)$/.test(p[p.length-1]))return p.slice(-3).join('.');return p.length>=2?p.slice(-2).join('.'):h;}"
+            "function sameSite(h){return baseDom(h)===baseDom(location.hostname);}"
             "function chk(u){try{if(isWl(location.hostname))return 0;var l=u.toLowerCase();var h=new URL(l).hostname;"
-            "if(isWl(h))return 0;while(h){if(b.has(h))return 1;var i=h.indexOf('.');if(i<0)break;h=h.substr(i+1);}"
+            "if(isWl(h))return 0;"
+            "if(sameSite(h))return 0;"
+            "while(h){if(b.has(h))return 1;var i=h.indexOf('.');if(i<0)break;h=h.substr(i+1);}"
             "if(/(\\/ads?\\/|\\/ad[sx]?\\b|\\/pagead\\/|\\/ptracking|\\/advert|\\/sponsored|\\/promotion|\\/tracking\\/|\\/analytics\\/|\\/collect\\?|\\/beacon|\\/pixel|\\/imp\\?|\\/impression|\\/click\\?|ad_banner|ad_frame|sponsored_content|promo_banner|[?&](ad|ads|adunit|adformat|adtag)=)/i.test(l))return 1;"
             "if(/(?:\\/(?:adcontent|img\\/adv|web-ad|iframead|contentad|ad\\/image|video-ad|stats\\/event|xtclicks|adscript|bannerad|googlead|adhandler|adimages|adconfig|tracking\\/track|tracker\\/track|adrequest|nativead|adman|advertisement|adframe|adcontrol|adoverlay|adserver|adsense|google-ads|ad-banner|banner-ad|adplacement|adblockdetect|advertising|admanagement|adprovider|adrotation|adunit|adcall|adlog|adcount|adserve|adsrv|adsys|adtrack|adview|adwidget|adzone|sidebar-ads|footer-ads|top-ads|bottom-ads|ads\\.php|ad\\.js|ad\\.css))/i.test(l))return 1;"
             "if(/\\/api\\/stats\\/(ads|atr)/i.test(l))return 1;"
@@ -1767,9 +2244,15 @@ class Browser(QMainWindow):
         model = QStringListModel(unique, self._completer)
         self._completer.setModel(model)
 
-    def _add_new_tab(self, url: str = "", insert_after: int = None):
+    def _add_new_tab(self, url: str = "", insert_after: int = None, load_url: bool = True):
         tab = ChromeTab()
-        tab.url = url or self._home_url
+        if load_url:
+            tab.url = url or self._home_url
+        else:
+            # Popup/OAuth: Chromium will navigate this page. Do not load() a
+            # second copy — that would break window.opener.
+            tab.url = url or "about:blank"
+            tab.is_popup = True
 
         # Use custom BrowserPage for OAuth handling
         tab.web_view = QWebEngineView()
@@ -1782,6 +2265,7 @@ class Browser(QMainWindow):
         page.loadProgress.connect(lambda p: self._on_load_progress(tab, p))
         page.urlChanged.connect(lambda u: self._on_url_changed(tab, u))
         page.titleChanged.connect(lambda t: self._on_title_changed(tab, t))
+        page.windowCloseRequested.connect(lambda t=tab: self._on_window_close_requested(t))
 
         # Inject ad hider on load
         page.loadFinished.connect(lambda ok: self._inject_ad_hider(page) if ok else None)
@@ -1800,8 +2284,9 @@ class Browser(QMainWindow):
         self._active_tab_index = insert_idx
         self._web_panel.setCurrentWidget(tab.web_view)
 
-        # Navigate
-        tab.web_view.load(QUrl(tab.url))
+        if load_url:
+            tab.web_view.load(_to_qurl(tab.url))
+        return tab
 
     def _on_tab_clicked(self, index: int):
         if 0 <= index < len(self._tabs):
@@ -1876,11 +2361,28 @@ class Browser(QMainWindow):
         self._tab_strip.update()
 
     def _on_url_changed(self, tab: ChromeTab, url: QUrl):
-        tab.url = url.toString()
+        url_str = url.toString()
+        tab.url = url_str
+        if tab.is_popup:
+            if url_str and not url_str.startswith("about:") and _is_ad_url(url_str):
+                QTimer.singleShot(0, lambda t=tab: self._safe_close_tab(t))
+                return
+            # After Google/OAuth, the popup often goes to about:blank (black tab).
+            if url_str and not url_str.startswith("about:"):
+                tab._popup_had_page = True
+            elif getattr(tab, "_popup_had_page", False):
+                QTimer.singleShot(400, lambda t=tab: self._close_empty_popup(t))
         if tab == self._active_tab():
             self._address.setText(tab.url)
         # Re-trigger autofill for multi-step logins
         self._try_autofill(tab)
+
+    def _close_empty_popup(self, tab: ChromeTab):
+        if tab not in self._tabs or not tab.is_popup:
+            return
+        u = (tab.url or "").lower()
+        if u.startswith("about:") or not u:
+            self._safe_close_tab(tab)
 
     def _on_title_changed(self, tab: ChromeTab, title: str):
         tab.title = title
@@ -1904,43 +2406,110 @@ class Browser(QMainWindow):
             return self._tabs[self._active_tab_index]
         return None
 
-    def _on_ad_blocked_navigation(self, page):
-        """Handle ad-blocked navigation like Ceprkac - go back or close tab."""
-        tab = self._find_tab_by_page(page)
-        if not tab:
+    def _install_script(self, name: str, source: str, world, point, subframes: bool = True):
+        script = QWebEngineScript()
+        script.setName(name)
+        script.setSourceCode(source)
+        script.setWorldId(world)
+        script.setInjectionPoint(point)
+        script.setRunsOnSubFrames(subframes)
+        self._profile.scripts().insert(script)
+
+    def _install_chrome_compat_script(self):
+        """Inject Chrome-like globals before any page script runs."""
+        self._install_script(
+            "gbrowser-chrome-compat",
+            CHROME_COMPAT_JS,
+            QWebEngineScript.ScriptWorldId.MainWorld,
+            QWebEngineScript.InjectionPoint.DocumentCreation,
+            True,
+        )
+        self._install_script(
+            "gbrowser-no-passkey",
+            DISABLE_PASSKEY_JS,
+            QWebEngineScript.ScriptWorldId.MainWorld,
+            QWebEngineScript.InjectionPoint.DocumentCreation,
+            True,
+        )
+
+    def _install_gsecurity_scripts(self):
+        """Install GSecurity-Ad-Shield content/main-world scripts on the profile."""
+        if not self._gsec_dir:
             return
-        # Use tab reference, not captured index (fix #3)
-        is_empty = not tab.url or tab.url == "about:blank" or tab.url.startswith("data:")
-        if is_empty and len(self._tabs) > 1:
-            QTimer.singleShot(100, lambda: self._safe_close_tab(tab))
-        else:
-            # Tab has content - go back
-            tab.web_view.back()
+        # Never run Shield scripts on IdP hosts — they break Google Sign-In.
+        auth_prefix = (
+            "(function(){var h=(location.hostname||'').toLowerCase();"
+            "if(/accounts\\.google|accounts\\.youtube|myaccount\\.google|appleid\\.apple|"
+            "login\\.microsoft|login\\.live|idmsa\\.apple/.test(h))return;\n"
+        )
+        auth_suffix = "\n})();"
+        chrome_shim = (
+            "window.__gsecMainWorldLink=true;"
+            "if(typeof chrome==='undefined'){window.chrome={runtime:{getURL:function(){return '';}}};}\n"
+        )
+        files = (
+            ("gsec-main-world", "main-world.js",
+             QWebEngineScript.ScriptWorldId.MainWorld,
+             QWebEngineScript.InjectionPoint.DocumentCreation, True, False),
+            ("gsec-cosmetic", "content-cosmetic.js",
+             QWebEngineScript.ScriptWorldId.ApplicationWorld,
+             QWebEngineScript.InjectionPoint.DocumentCreation, True, True),
+            ("gsec-sites", "content-sites.js",
+             QWebEngineScript.ScriptWorldId.ApplicationWorld,
+             QWebEngineScript.InjectionPoint.DocumentCreation, True, True),
+            ("gsec-youtube", "content.js",
+             QWebEngineScript.ScriptWorldId.ApplicationWorld,
+             QWebEngineScript.InjectionPoint.DocumentCreation, True, True),
+            ("gsec-generic", "content-generic.js",
+             QWebEngineScript.ScriptWorldId.ApplicationWorld,
+             QWebEngineScript.InjectionPoint.Deferred, True, True),
+        )
+        for name, filename, world, point, frames, need_shim in files:
+            path = os.path.join(self._gsec_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                    source = f.read()
+            except Exception:
+                continue
+            if need_shim:
+                source = chrome_shim + source
+            self._install_script(name, auth_prefix + source + auth_suffix, world, point, frames)
+        # Full-screen interstitials: the iframe is blocked so the leftover
+        # veil is a black page. Hide the curtain and unlock scroll.
+        self._install_script(
+            "gsec-overlay-cleanup",
+            GSEC_OVERLAY_CLEANUP_JS,
+            QWebEngineScript.ScriptWorldId.ApplicationWorld,
+            QWebEngineScript.InjectionPoint.DocumentReady,
+            True,
+        )
+        self._install_script(
+            "gsec-slot-collapse",
+            GSEC_SLOT_COLLAPSE_JS,
+            QWebEngineScript.ScriptWorldId.ApplicationWorld,
+            QWebEngineScript.InjectionPoint.DocumentReady,
+            True,
+        )
 
-    def _find_tab_by_page(self, page) -> ChromeTab | None:
-        for tab in self._tabs:
-            if tab.web_view and tab.web_view.page() == page:
-                return tab
-        return None
-
-    def _handle_new_window_url(self, page, url: QUrl):
-        """Handle new window creation (OAuth popups)."""
-        url_str = url.toString()
-        if _is_ad_url(url_str):
-            return  # Block ad popups
-        # For auth flows, open in new tab
-        if _is_auth_url(url_str):
-            self._add_new_tab(url_str)
-        else:
-            # Regular links open in new tab
-            self._add_new_tab(url_str)
+    def _on_window_close_requested(self, tab: ChromeTab):
+        """Honor window.close() so OAuth callback tabs can dismiss themselves."""
+        if tab not in self._tabs:
+            return
+        if len(self._tabs) > 1:
+            self._safe_close_tab(tab)
+        elif tab.is_popup:
+            tab.is_popup = False
+            self._navigate_tab(tab, self._home_url)
 
     def _check_auto_close_auth_tab(self, tab: ChromeTab):
-        """Auto-close auth callback tabs like Ceprkac."""
-        url = tab.url.lower()
-        if "/callback" in url and ("oauth" in url or "auth" in url):
-            # Auth callback - auto-close after delay, using tab reference (fix #3)
-            QTimer.singleShot(1500, lambda: self._safe_close_tab(tab))
+        """Auto-close auth callback tabs like Ceprkac.
+        Only close if this is clearly a popup-style auth tab (opened by createWindow),
+        not the main tab the user is actively using."""
+        # Disabled: auto-closing tabs during OAuth flows causes login failures
+        # (e.g. Reddit via Google OAuth — the callback page needs to finish processing)
+        pass
 
     def _on_download_requested(self, download):
         """Handle download requests like Ceprkac's DownloadStarting."""
@@ -1993,19 +2562,17 @@ class Browser(QMainWindow):
 
         if is_youtube:
             page.runJavaScript(YOUTUBE_AD_BLOCKER_JS)
-            # Also inject main-world YouTube blocker via <script> tag
             page.runJavaScript(YOUTUBE_MAIN_WORLD_INJECTOR_JS)
             return
 
-        # Skip generic element hiding on whitelisted sites (non-YouTube)
-        if _is_whitelisted(page_host):
+        # GSecurity-Ad-Shield scripts (plus Pac lists) are installed on the
+        # profile and run on every page. Do not pile on the old element hider.
+        if self._gsec_dir:
             return
 
+        if _is_whitelisted(page_host):
+            return
         page.runJavaScript(AD_ELEMENT_HIDER_JS)
-
-        # Use cached main-world blocker JS (perf improvement #14)
-        if self._cached_main_world_js:
-            page.runJavaScript(self._cached_main_world_js)
 
     def _try_autofill(self, tab: ChromeTab):
         now = time.time()
@@ -2022,6 +2589,12 @@ class Browser(QMainWindow):
                 return
             domain = domain.lower()
         except Exception:
+            return
+
+        # Phone 2FA / OAuth consent pages often have leftover password fields.
+        # Filling them submits a malformed request (Google HTTP 400) even though
+        # the authenticator tap already signed the user in.
+        if _is_idp_challenge_url(tab.url):
             return
 
         matches = self._passwords.get_matches(domain)
@@ -2407,7 +2980,7 @@ class Browser(QMainWindow):
         tab = self._active_tab()
         if tab and tab.web_view:
             tab.url = url
-            tab.web_view.load(QUrl(url))
+            tab.web_view.load(_to_qurl(url))
 
     def _go_back(self):
         tab = self._active_tab()
@@ -2427,7 +3000,7 @@ class Browser(QMainWindow):
     def _navigate_tab(self, tab: ChromeTab | None, url: str):
         if tab and tab.web_view:
             tab.url = url
-            tab.web_view.load(QUrl(url))
+            tab.web_view.load(_to_qurl(url))
 
     def _update_bookmark_star(self):
         tab = self._active_tab()
@@ -2479,6 +3052,8 @@ def _resource_path(filename: str) -> str:
 
 
 if __name__ == "__main__":
+    # QTWEBENGINE_CHROMIUM_FLAGS is set at import time (before QtWebEngine loads).
+
     # Note: GPU acceleration is enabled by default for best performance.
     # If you encounter crashes in VMs or headless environments, uncomment:
     # os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox")
@@ -2492,7 +3067,7 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.6")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.7")
     except Exception:
         pass
 
