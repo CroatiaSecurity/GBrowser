@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.4-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-5.5-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.13+-green?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/engine-Chromium%20(QtWebEngine)-orange?style=flat-square" alt="Engine">
   <img src="https://img.shields.io/badge/license-proprietary-red?style=flat-square" alt="License">
@@ -31,6 +31,8 @@ Originally written in C# as **Ceprkac**, the browser has been fully ported to Py
 
 ### 🛡️ Privacy & Ad Blocking
 - **Built-in ad blocker** — blocks 300+ ad/tracking domains at the network level via request interception
+- **Smart first-party detection** — pattern-based blocking only applies to third-party requests, so sites like Discord and Reddit work without lag or login issues
+- **GSecurity-Ad-Shield integration** — imports additional 648+ domains from the GSecurity blocklist
 - **DOM-level ad removal** — injects CSS and JavaScript to hide ad elements on pages
 - **YouTube-specific ad blocking** — dedicated blocker that skips video ads, removes overlay ads, and strips ad data from YouTube API responses
 - **Main-world script injection** — intercepts `JSON.parse`, `fetch`, and `XMLHttpRequest` to block ads before they render
@@ -134,9 +136,9 @@ build.bat
 This will:
 1. Install dependencies
 2. Build with PyInstaller (`--onedir --windowed`)
-3. Package with Inno Setup into `releases/5.4/GBrowser-5.4-Setup.exe`
+3. Package with Inno Setup into `releases/5.5/GBrowser-5.5-Setup.exe`
 
-> ⚙️ Requires [PyInstaller](https://pyinstaller.org/) and [Inno Setup 6](https://jrsoftware.org/isinfo.php) to be installed.
+> ⚙️ Requires [PyInstaller](https://pyinstaller.org/) and [Inno Setup 7](https://jrsoftware.org/isinfo.php) to be installed.
 
 ---
 
@@ -179,7 +181,7 @@ All user data is stored in `~/.gorstak_browser/`:
 | Browser Engine | Chromium (via QtWebEngine) |
 | Encryption | Windows DPAPI / Fernet (AES) |
 | Build Tool | PyInstaller |
-| Installer | Inno Setup 6 |
+| Installer | Inno Setup 7 |
 
 ---
 
