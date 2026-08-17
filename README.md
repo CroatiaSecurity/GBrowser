@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.7-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-5.8-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.13+-green?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/engine-Chromium%20(QtWebEngine)-orange?style=flat-square" alt="Engine">
   <img src="https://img.shields.io/badge/license-proprietary-red?style=flat-square" alt="License">
@@ -30,14 +30,14 @@ Originally written in C# as **Ceprkac**, the browser has been fully ported to Py
 ## ✨ Features
 
 ### 🛡️ Privacy & Ad Blocking
-- **Built-in ad blocker** — blocks 300+ ad/tracking domains at the network level via request interception
-- **Smart first-party detection** — pattern-based blocking only applies to third-party requests, so sites like Discord and Reddit work without lag or login issues
-- **GSecurity-Ad-Shield integration** — imports additional 648+ domains from the GSecurity blocklist
-- **DOM-level ad removal** — injects CSS and JavaScript to hide ad elements on pages
+- **Built-in ad blocker** — blocks known ad/tracking domains at the network level via request interception
+- **Smart first-party detection** — same-site requests are never blocked, so Discord, Reddit, and login flows keep working
+- **GSecurity-Ad-Shield + Pac** — loads `GSecurity-Ad-Shield` blocklist/rules/scripts and `BlockAds.pac` host lists when those trees are next to the app
+- **DOM-level ad removal** — GSecurity cosmetic/generic/site scripts hide ad slots; GPT/DFP placeholders collapse so news sites do not leave empty bands
 - **YouTube-specific ad blocking** — dedicated blocker that skips video ads, removes overlay ads, and strips ad data from YouTube API responses
-- **Main-world script injection** — intercepts `JSON.parse`, `fetch`, and `XMLHttpRequest` to block ads before they render
 - **Custom blocklist support** — load additional domains from `blocklist.txt`
 - **Whitelist system** — banking, auth, AI services, gaming platforms, and other essential sites are never blocked
+- **No full-page overlay scrubber** — aggressive overlay hiding was removed so login and video pages stay visible
 
 ### 🔐 Password Manager
 - **Encrypted credential storage** — uses Windows DPAPI on Windows, Fernet (AES-128) fallback on other platforms
@@ -69,14 +69,18 @@ Originally written in C# as **Ceprkac**, the browser has been fully ported to Py
 - **Zoom controls** — `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0`
 
 ### 🔑 OAuth & Authentication
-- **OAuth popup handling** — Google, Apple, Microsoft, Twitter/X, and other OAuth flows open correctly in new tabs
-- **Auth callback auto-close** — OAuth callback tabs close automatically after authentication completes
+- **Google Sign-In** — uses a Firefox user-agent only on Google account hosts so Qt WebEngine is not rejected as an insecure app
+- **OAuth popups** — Google / Reddit and other `window.open` login flows load in a real tab so `window.opener` stays intact
+- **Passkeys off** — WebAuthn/passkey prompts are disabled in the engine and dismissed in the page
+- **Camera and microphone** — Chrome-style prompt: pick a device and allow this time, this visit, or always
 - **Auth domain whitelist** — login flows are never blocked by the ad blocker
 
 ### 📥 Downloads
-- **Download manager** — dialog showing recent downloads with progress tracking
+- **Toolbar dropdown** — ↓ next to the bookmark star, with live progress bars
+- **Open files** — click a finished download to open it, right-click to show the folder
 - **Save-as dialog** — choose where to save each download
-- **Status bar progress** — live download progress in the status bar
+- **Status bar progress** — live size and percent while a file is downloading
+- **Persistent list** — completed downloads are remembered across restarts
 
 ### 🎨 Interface
 - **Dark theme** — Chrome-dark inspired color palette throughout
@@ -136,7 +140,7 @@ build.bat
 This will:
 1. Install dependencies
 2. Build with PyInstaller (`--onedir --windowed`)
-3. Package with Inno Setup into `releases/5.7/GBrowser-5.7-Setup.exe`
+3. Package with Inno Setup into `releases/5.8/GBrowser-5.8-Setup.exe`
 
 > ⚙️ Requires [PyInstaller](https://pyinstaller.org/) and [Inno Setup 7](https://jrsoftware.org/isinfo.php) to be installed.
 
@@ -161,13 +165,15 @@ All user data is stored in `~/.gorstak_browser/`:
 
 ```
 ~/.gorstak_browser/
-├── config.json        # Window geometry and state
-├── settings.txt       # Homepage and search engine
-├── bookmarks.txt      # Bookmarks (with folder support)
-├── history.txt        # Browsing history (last 100 URLs)
-├── passwords.dat      # Encrypted credentials (DPAPI or Fernet)
-├── storage/           # WebEngine persistent storage
-└── cache/             # WebEngine cache
+├── config.json             # Window geometry and state
+├── settings.txt            # Homepage and search engine
+├── bookmarks.txt           # Bookmarks (with folder support)
+├── history.txt             # Browsing history (last 100 URLs)
+├── passwords.dat           # Encrypted credentials (DPAPI or Fernet)
+├── downloads.json          # Completed download list
+├── media_permissions.json  # Always-allow / always-block camera and mic
+├── storage/                # WebEngine persistent storage
+└── cache/                  # WebEngine cache
 ```
 
 ---

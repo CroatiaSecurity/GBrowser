@@ -12,7 +12,8 @@ if "UserAgentClientHint" not in _flags:
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
         f"{_flags} --disable-features=UserAgentClientHint,AutomationControlled,"
         "WebAuthentication,WebAuthenticationCable,WebAuthenticationHybridTransport "
-        "--disable-blink-features=AutomationControlled,WebAuthentication"
+        "--disable-blink-features=AutomationControlled,WebAuthentication "
+        "--enable-media-stream"
     ).strip()
 
 import json
@@ -47,6 +48,8 @@ BOOKMARKS_FILE = os.path.join(CONFIG_DIR, "bookmarks.txt")
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history.txt")
 PASSWORDS_FILE = os.path.join(CONFIG_DIR, "passwords.dat")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.txt")
+MEDIA_PERM_FILE = os.path.join(CONFIG_DIR, "media_permissions.json")
+DOWNLOADS_FILE = os.path.join(CONFIG_DIR, "downloads.json")
 
 # === COLOUR PALETTE (Chrome-dark inspired, matching Ceprkac) ===
 class Theme:
@@ -1196,12 +1199,194 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
             pass
 
 
+def _load_media_permissions() -> dict:
+    try:
+        with open(MEDIA_PERM_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_media_permissions(data: dict) -> None:
+    try:
+        with open(MEDIA_PERM_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def _list_media_devices() -> tuple[list[str], list[str]]:
+    cams, mics = [], []
+    try:
+        from PyQt6.QtMultimedia import QMediaDevices
+        cams = [d.description() for d in QMediaDevices.videoInputs() if d.description()]
+        mics = [d.description() for d in QMediaDevices.audioInputs() if d.description()]
+    except Exception:
+        pass
+    return cams, mics
+
+
+def _permission_kinds(type_name: str) -> list[str]:
+    n = (type_name or "").lower()
+    kinds = []
+    if "desktop" in n:
+        kinds.append("screen")
+    if "video" in n or "mediaaudiovideo" in n:
+        kinds.append("camera")
+    if "audio" in n and "desktop" not in n:
+        kinds.append("microphone")
+    if "mediaaudio" in n and "video" not in n:
+        if "microphone" not in kinds:
+            kinds.append("microphone")
+    if not kinds and any(x in n for x in ("media", "video", "audio")):
+        kinds = ["camera", "microphone"]
+    return kinds
+
+
+class MediaPermissionDialog(QDialog):
+    """Chrome-style camera/mic prompt: which device, and how long to allow."""
+
+    def __init__(self, origin: str, kinds: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("GBrowser")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self._choice = "deny"
+        bg = f"rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()})"
+        box = f"rgb({Theme.AddressBox.red()},{Theme.AddressBox.green()},{Theme.AddressBox.blue()})"
+        self.setStyleSheet(
+            f"QDialog {{ background: {bg}; color: white; }}"
+            f"QLabel {{ color: white; }}"
+            f"QComboBox {{ background: {box}; color: white; border: 1px solid rgb(60,64,67);"
+            f" border-radius: 4px; padding: 4px 8px; min-height: 24px; }}"
+            f"QComboBox QAbstractItemView {{ background: {box}; color: white; }}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        host = origin
+        try:
+            host = urlparse(origin).hostname or origin
+        except Exception:
+            pass
+        what = " and ".join(kinds) if kinds else "your camera"
+        title = QLabel(f"{host} wants to use your {what}")
+        title.setWordWrap(True)
+        title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        layout.addWidget(title)
+
+        hint = QLabel("Choose a device and how long this site may use it.")
+        hint.setStyleSheet("color: rgb(180,184,190);")
+        layout.addWidget(hint)
+
+        cams, mics = _list_media_devices()
+        self._cam_combo = None
+        self._mic_combo = None
+        if "camera" in kinds:
+            layout.addWidget(QLabel("Camera"))
+            self._cam_combo = QComboBox()
+            if cams:
+                self._cam_combo.addItems(cams)
+            else:
+                self._cam_combo.addItem("Default camera")
+            layout.addWidget(self._cam_combo)
+        if "microphone" in kinds:
+            layout.addWidget(QLabel("Microphone"))
+            self._mic_combo = QComboBox()
+            if mics:
+                self._mic_combo.addItems(mics)
+            else:
+                self._mic_combo.addItem("Default microphone")
+            layout.addWidget(self._mic_combo)
+
+        layout.addWidget(QLabel("Allow access"))
+        self._duration = QComboBox()
+        self._duration.addItem("This time only", "once")
+        self._duration.addItem("While visiting this site", "session")
+        self._duration.addItem("Always on this site", "always")
+        self._duration.setCurrentIndex(1)
+        layout.addWidget(self._duration)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        block = QPushButton("Block")
+        block.setStyleSheet(
+            "QPushButton { background: rgb(60,64,67); color: white; border: none;"
+            " border-radius: 4px; padding: 8px 16px; }"
+            "QPushButton:hover { background: rgb(80,84,87); }")
+        block.clicked.connect(self._on_block)
+        allow = QPushButton("Allow")
+        allow.setStyleSheet(
+            f"QPushButton {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()});"
+            f" color: black; border: none; border-radius: 4px; padding: 8px 16px; font-weight: 600; }}")
+        allow.clicked.connect(self._on_allow)
+        btns.addWidget(block)
+        btns.addWidget(allow)
+        layout.addLayout(btns)
+
+    def _on_allow(self):
+        self._choice = self._duration.currentData() or "session"
+        self.accept()
+
+    def _on_block(self):
+        dur = self._duration.currentData() or "once"
+        self._choice = "block-always" if dur == "always" else "deny"
+        self.reject()
+
+    def choice(self) -> str:
+        return self._choice
+
+
 # === CUSTOM WEB PAGE FOR POPUP HANDLING (Ceprkac-style) ===
 class BrowserPage(QWebEnginePage):
     def __init__(self, profile, parent=None, browser_window=None):
         super().__init__(profile, parent)
         self.browser_window = browser_window
         self._last_url = ""
+        # Qt 6.8+ uses permissionRequested; older builds use featurePermissionRequested.
+        if hasattr(self, "permissionRequested"):
+            self.permissionRequested.connect(self._on_permission_requested)
+        if hasattr(self, "featurePermissionRequested"):
+            self.featurePermissionRequested.connect(self._on_feature_permission_requested)
+
+    def _on_permission_requested(self, permission):
+        try:
+            ptype = permission.permissionType()
+            name = getattr(ptype, "name", str(ptype))
+            origin = ""
+            try:
+                origin = permission.origin().toString() if permission.origin() else ""
+            except Exception:
+                origin = self.url().toString()
+            kinds = _permission_kinds(name)
+            if kinds and self.browser_window:
+                self.browser_window._handle_media_permission(origin, kinds, permission, None)
+                return
+            quiet = {"Notifications", "Geolocation", "MouseLock", "ClipboardReadWrite"}
+            if name in quiet:
+                permission.grant()
+            else:
+                permission.deny()
+        except Exception:
+            try:
+                permission.deny()
+            except Exception:
+                pass
+
+    def _on_feature_permission_requested(self, origin, feature):
+        try:
+            name = getattr(feature, "name", str(feature))
+            kinds = _permission_kinds(name)
+            origin_s = origin.toString() if hasattr(origin, "toString") else str(origin)
+            if kinds and self.browser_window:
+                self.browser_window._handle_media_permission(
+                    origin_s, kinds, None, (self, origin, feature))
+                return
+            grant = QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+            self.setFeaturePermission(origin, feature, grant)
+        except Exception:
+            pass
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
         url_str = url.toString()
@@ -1585,11 +1770,74 @@ def _make_fill_username_js(username: str) -> str:
 
 # === DOWNLOAD ITEM TRACKER ===
 class DownloadItem:
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, path: str = "", url: str = ""):
         self.filename = filename
+        self.path = path
+        self.url = url
         self.received = 0
         self.total = 0
         self.status = "Downloading"
+
+    def to_dict(self) -> dict:
+        return {
+            "filename": self.filename, "path": self.path, "url": self.url,
+            "received": self.received, "total": self.total, "status": self.status,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "DownloadItem":
+        item = DownloadItem(d.get("filename", ""), d.get("path", ""), d.get("url", ""))
+        item.received = int(d.get("received") or 0)
+        item.total = int(d.get("total") or 0)
+        item.status = d.get("status") or "Complete"
+        return item
+
+
+def _format_bytes(n: int) -> str:
+    n = max(0, int(n or 0))
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f" {n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _open_local_path(path: str, select: bool = False) -> None:
+    if not path:
+        return
+    try:
+        if select and os.path.exists(path):
+            os.startfile(os.path.dirname(path))
+        elif os.path.isdir(path):
+            os.startfile(path)
+        elif os.path.exists(path):
+            os.startfile(path)
+        elif os.path.dirname(path):
+            os.startfile(os.path.dirname(path))
+    except Exception:
+        pass
+
+
+def _load_downloads() -> list[DownloadItem]:
+    try:
+        with open(DOWNLOADS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        return [DownloadItem.from_dict(d) for d in data if isinstance(d, dict)][-40:]
+    except Exception:
+        return []
+
+
+def _save_downloads(items: list[DownloadItem]) -> None:
+    try:
+        done = [i for i in items if i.status != "Downloading"][-40:]
+        with open(DOWNLOADS_FILE, "w", encoding="utf-8") as f:
+            json.dump([i.to_dict() for i in done], f, indent=2)
+    except Exception:
+        pass
 
 
 # === HISTORY DIALOG ===
@@ -1668,6 +1916,127 @@ class DownloadManagerDialog(QDialog):
             f"color: black; border: none; border-radius: 4px; padding: 6px 16px; }}")
         close_btn.clicked.connect(self.reject)
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+
+class DownloadsPopup(QFrame):
+    """Dropdown list of downloads with live progress bars."""
+
+    def __init__(self, browser: "Browser"):
+        super().__init__(None)
+        self._browser = browser
+        self.setWindowFlags(
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        self.setFixedWidth(380)
+        self.setMaximumHeight(440)
+        self.setStyleSheet(
+            f"QFrame {{ background: rgb({Theme.ActiveTab.red()},{Theme.ActiveTab.green()},{Theme.ActiveTab.blue()});"
+            f" color: white; border: 1px solid rgb({Theme.Border.red()},{Theme.Border.green()},{Theme.Border.blue()}); }}"
+            f"QLabel {{ color: white; border: none; }}"
+            f"QProgressBar {{ border: none; background: rgb(40,41,45); height: 6px; border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: rgb({Theme.Accent.red()},{Theme.Accent.green()},{Theme.Accent.blue()}); border-radius: 3px; }}"
+            f"QPushButton {{ background: transparent; color: rgb(180,184,190); border: none; padding: 4px 8px; }}"
+            f"QPushButton:hover {{ color: white; }}")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 8, 8, 8)
+        self._layout.setSpacing(6)
+        self._rows_host = QWidget()
+        self._rows = QVBoxLayout(self._rows_host)
+        self._rows.setContentsMargins(0, 0, 0, 0)
+        self._rows.setSpacing(8)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(self._rows_host)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self._layout.addWidget(scroll, 1)
+        footer = QHBoxLayout()
+        open_folder = QPushButton("Open folder")
+        open_folder.clicked.connect(self._open_folder)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._clear)
+        footer.addWidget(open_folder)
+        footer.addStretch(1)
+        footer.addWidget(clear_btn)
+        self._layout.addLayout(footer)
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self.refresh)
+        self._empty = QLabel("No downloads yet.")
+        self._empty.setStyleSheet("color: rgb(180,184,190); padding: 12px;")
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def popup_at(self, global_pos: QPoint):
+        self.refresh()
+        self.resize(380, min(440, 80 + 72 * max(1, min(6, len(self._browser._downloads)))))
+        self.move(global_pos)
+        self.show()
+        self.raise_()
+        self._timer.start()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def refresh(self):
+        while self._rows.count():
+            item = self._rows.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        items = list(reversed(self._browser._downloads[-15:]))
+        if not items:
+            self._rows.addWidget(self._empty)
+            return
+        for dl in items:
+            self._rows.addWidget(self._make_row(dl))
+
+    def _make_row(self, dl: DownloadItem) -> QWidget:
+        row = QWidget()
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        col = QVBoxLayout(row)
+        col.setContentsMargins(4, 2, 4, 2)
+        col.setSpacing(3)
+        if dl.status == "Downloading" and dl.total > 0:
+            pct = min(100, int(dl.received * 100 / dl.total))
+            detail = f"{_format_bytes(dl.received)} / {_format_bytes(dl.total)}  ({pct}%)"
+        elif dl.status == "Downloading":
+            pct = 0
+            detail = f"{_format_bytes(dl.received)}  —  downloading"
+        else:
+            pct = 100 if dl.status == "Complete" else 0
+            detail = f"{dl.status}  ·  {_format_bytes(dl.received or dl.total)}"
+        name = QLabel(dl.filename)
+        name.setStyleSheet("font-size: 12px;")
+        info = QLabel(detail)
+        info.setStyleSheet("color: rgb(180,184,190); font-size: 11px;")
+        bar = QProgressBar()
+        bar.setTextVisible(False)
+        bar.setMaximum(100)
+        bar.setValue(pct)
+        col.addWidget(name)
+        col.addWidget(bar)
+        col.addWidget(info)
+        row.mousePressEvent = lambda e, item=dl: self._clicked(item, e)
+        return row
+
+    def _clicked(self, dl: DownloadItem, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            _open_local_path(dl.path, select=True)
+        else:
+            _open_local_path(dl.path, select=False)
+        self.hide()
+
+    def _open_folder(self):
+        for dl in reversed(self._browser._downloads):
+            if dl.path:
+                _open_local_path(dl.path, select=True)
+                break
+        self.hide()
+
+    def _clear(self):
+        self._browser._downloads = [d for d in self._browser._downloads if d.status == "Downloading"]
+        _save_downloads(self._browser._downloads)
+        self.refresh()
 
 
 # Hide Qt/automation fingerprints that Google Sign-In uses to reject the browser.
@@ -1765,55 +2134,6 @@ DISABLE_PASSKEY_JS = r"""
 """
 
 
-# Full-screen ad popups leave a black veil after the iframe is blocked.
-GSEC_OVERLAY_CLEANUP_JS = r"""
-(function(){
-  var host = (location.hostname || '').toLowerCase();
-  if (/google\.|gstatic\.|youtube\.|googleapis\.|appleid\.|microsoftonline\.|live\.com|microsoft\.com/.test(host))
-    return;
-  if (window.__gsecOverlayClean) return;
-  window.__gsecOverlayClean = true;
-  function wipe(){
-    try{
-      var body = document.body;
-      if (!body) return;
-      var nodes = document.querySelectorAll('div,section,aside,dialog');
-      for (var i = 0; i < nodes.length; i++){
-        var el = nodes[i];
-        if (el.getAttribute('data-gsec-bait')) continue;
-        var st = window.getComputedStyle(el);
-        if (st.position !== 'fixed' && st.position !== 'sticky') continue;
-        var r = el.getBoundingClientRect();
-        if (r.width < innerWidth * 0.85 || r.height < innerHeight * 0.85) continue;
-        if (el.querySelector('video, input, textarea, [contenteditable="true"]')) continue;
-        var z = parseInt(st.zIndex, 10);
-        if (!isFinite(z) || z < 1000) continue;
-        var idc = ((el.id||'') + ' ' + (el.className||'')).toLowerCase();
-        var looksAd = /reklama|oglas|interstitial|prestitial|takeover|gpt-ad|adsbygoogle|ad-overlay|adoverlay/.test(idc);
-        var text = (el.innerText || '').replace(/\s+/g,' ').trim();
-        var frames = el.querySelectorAll('iframe');
-        var empty = text.length < 80;
-        if (looksAd || (empty && frames.length)) {
-          el.style.setProperty('display','none','important');
-          el.setAttribute('data-gsec-overlay','1');
-        }
-      }
-      if (document.querySelector('[data-gsec-overlay]')) {
-        body.style.removeProperty('overflow');
-        body.style.removeProperty('position');
-        document.documentElement.style.removeProperty('overflow');
-      }
-    }catch(e){}
-  }
-  wipe();
-  setTimeout(wipe, 200);
-  setTimeout(wipe, 800);
-  setTimeout(wipe, 2000);
-  setInterval(wipe, 2500);
-})();
-"""
-
-
 # Collapse reserved-height GPT/DFP slots (index.hr billboards etc.) after the
 # iframe is blocked — otherwise the page keeps a huge empty white band.
 GSEC_SLOT_COLLAPSE_JS = r"""
@@ -1870,11 +2190,14 @@ class Browser(QMainWindow):
         self._ad_blocker = AdBlockInterceptor()
         self._devtools_windows: list[QWebEngineView] = []
         self._download_windows: list[QWidget] = []
-        self._downloads: list[DownloadItem] = []
         self._closed_tabs: list[str] = []  # Stack of closed tab URLs (max 20)
         self._cached_main_world_js: str = ""  # Cached blocker JS
         self._last_bookmark_hash: int = 0  # For incremental bookmark bar updates
         self._gsec_dir: str = ""
+        self._media_always: dict = _load_media_permissions()
+        self._media_session: dict[str, str] = {}
+        self._downloads: list[DownloadItem] = _load_downloads()
+        self._dl_popup: DownloadsPopup | None = None
         self._profile = QWebEngineProfile("GBrowserProfile", self)
         # Real Chromium version, no QtWebEngine token. Combined with
         # QTWEBENGINE_CHROMIUM_FLAGS (set before import) and spoofed
@@ -1895,12 +2218,25 @@ class Browser(QMainWindow):
         self._profile.setCachePath(os.path.join(CONFIG_DIR, "cache"))
         self._profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
+        try:
+            self._profile.setPersistentPermissionsPolicy(
+                QWebEngineProfile.PersistentPermissionsPolicy.AskEveryTime)
+        except Exception:
+            pass
         ws = self._profile.settings()
         ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         ws.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
         ws.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
         ws.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
         ws.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+        try:
+            ws.setAttribute(QWebEngineSettings.WebAttribute.ScreenCaptureEnabled, True)
+        except Exception:
+            pass
+        try:
+            ws.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        except Exception:
+            pass
         try:
             ws.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
         except Exception:
@@ -2035,6 +2371,12 @@ class Browser(QMainWindow):
         self._bookmark_btn.setToolTip("Add bookmark (Ctrl+D)")
         self._bookmark_btn.clicked.connect(self._toggle_bookmark)
         nav_layout.addWidget(self._bookmark_btn)
+
+        self._dl_btn = QPushButton("\u2913")
+        self._dl_btn.setStyleSheet(btn_style)
+        self._dl_btn.setToolTip("Downloads")
+        self._dl_btn.clicked.connect(self._toggle_downloads_popup)
+        nav_layout.addWidget(self._dl_btn)
 
         self._menu_btn = QPushButton("\u2261")
         self._menu_btn.setStyleSheet(btn_style)
@@ -2415,6 +2757,77 @@ class Browser(QMainWindow):
         script.setRunsOnSubFrames(subframes)
         self._profile.scripts().insert(script)
 
+    def _media_stored_decision(self, origin: str) -> str | None:
+        host = origin
+        try:
+            host = urlparse(origin).scheme + "://" + (urlparse(origin).hostname or origin)
+        except Exception:
+            pass
+        rec = self._media_always.get(host) or self._media_always.get(origin) or {}
+        if isinstance(rec, str):
+            return rec
+        if rec.get("all") in ("allow", "block"):
+            return rec["all"]
+        if self._media_session.get(host) or self._media_session.get(origin):
+            return self._media_session.get(host) or self._media_session.get(origin)
+        return None
+
+    def _store_media_decision(self, origin: str, choice: str) -> None:
+        host = origin
+        try:
+            parsed = urlparse(origin)
+            if parsed.hostname:
+                host = f"{parsed.scheme}://{parsed.hostname}"
+        except Exception:
+            pass
+        if choice == "always":
+            self._media_always[host] = {"all": "allow"}
+            _save_media_permissions(self._media_always)
+        elif choice == "block-always":
+            self._media_always[host] = {"all": "block"}
+            _save_media_permissions(self._media_always)
+        elif choice == "session":
+            self._media_session[host] = "allow"
+
+    def _apply_media_result(self, permission, legacy, granted: bool) -> None:
+        if permission is not None:
+            try:
+                if granted:
+                    permission.grant()
+                else:
+                    permission.deny()
+            except Exception:
+                pass
+            return
+        if not legacy:
+            return
+        page, origin, feature = legacy
+        try:
+            policy = (QWebEnginePage.PermissionPolicy.PermissionGrantedByUser
+                      if granted else QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
+            page.setFeaturePermission(origin, feature, policy)
+        except Exception:
+            pass
+
+    def _handle_media_permission(self, origin: str, kinds: list[str], permission, legacy):
+        stored = self._media_stored_decision(origin)
+        if stored == "allow":
+            self._apply_media_result(permission, legacy, True)
+            return
+        if stored == "block":
+            self._apply_media_result(permission, legacy, False)
+            return
+        dlg = MediaPermissionDialog(origin, kinds, self)
+        result = dlg.exec()
+        choice = dlg.choice()
+        if result != QDialog.DialogCode.Accepted:
+            if choice == "block-always":
+                self._store_media_decision(origin, "block-always")
+            self._apply_media_result(permission, legacy, False)
+            return
+        self._store_media_decision(origin, choice)
+        self._apply_media_result(permission, legacy, True)
+
     def _install_chrome_compat_script(self):
         """Inject Chrome-like globals before any page script runs."""
         self._install_script(
@@ -2476,15 +2889,6 @@ class Browser(QMainWindow):
             if need_shim:
                 source = chrome_shim + source
             self._install_script(name, auth_prefix + source + auth_suffix, world, point, frames)
-        # Full-screen interstitials: the iframe is blocked so the leftover
-        # veil is a black page. Hide the curtain and unlock scroll.
-        self._install_script(
-            "gsec-overlay-cleanup",
-            GSEC_OVERLAY_CLEANUP_JS,
-            QWebEngineScript.ScriptWorldId.ApplicationWorld,
-            QWebEngineScript.InjectionPoint.DocumentReady,
-            True,
-        )
         self._install_script(
             "gsec-slot-collapse",
             GSEC_SLOT_COLLAPSE_JS,
@@ -2513,39 +2917,86 @@ class Browser(QMainWindow):
 
     def _on_download_requested(self, download):
         """Handle download requests like Ceprkac's DownloadStarting."""
-        suggested_path = download.suggestedFileName()
-        path, _ = QFileDialog.getSaveFileName(self, "Save As", suggested_path)
-        if path:
-            download.setDownloadFileName(path)
-            download.accept()
-            # Track download (#12)
-            dl_item = DownloadItem(suggested_path)
-            self._downloads.append(dl_item)
-            if len(self._downloads) > 20:
-                self._downloads = self._downloads[-20:]
-            self._status_label.setText(f"Downloading: {suggested_path}")
-            download.downloadProgress.connect(
-                lambda received, total: self._update_download_status(received, total, dl_item))
-            download.finished.connect(lambda: self._download_finished(dl_item))
-        else:
+        suggested = download.suggestedFileName() or "download"
+        path, _ = QFileDialog.getSaveFileName(self, "Save As", suggested)
+        if not path:
             download.cancel()
+            return
+        download.setDownloadFileName(path)
+        download.accept()
+        url = ""
+        try:
+            url = download.url().toString()
+        except Exception:
+            pass
+        dl_item = DownloadItem(os.path.basename(path), path, url)
+        self._downloads.append(dl_item)
+        if len(self._downloads) > 40:
+            self._downloads = self._downloads[-40:]
+        self._status_label.setText(f"Downloading {dl_item.filename}…")
+        self._refresh_dl_button()
+        download.downloadProgress.connect(
+            lambda received, total, item=dl_item: self._update_download_status(received, total, item))
+        download.finished.connect(lambda item=dl_item, req=download: self._download_finished(item, req))
+        if self._dl_popup and self._dl_popup.isVisible():
+            self._dl_popup.refresh()
 
     def _update_download_status(self, received: int, total: int, dl_item: DownloadItem):
         dl_item.received = received
         dl_item.total = total
         if total > 0:
-            self._status_label.setText(f"Downloading {dl_item.filename}: {received}/{total} bytes")
+            pct = int(received * 100 / total)
+            self._status_label.setText(
+                f"Downloading {dl_item.filename}: {_format_bytes(received)} / {_format_bytes(total)} ({pct}%)")
+            self._dl_btn.setToolTip(f"Downloads — {dl_item.filename} {pct}%")
         else:
-            self._status_label.setText(f"Downloading {dl_item.filename}: {received} bytes")
+            self._status_label.setText(
+                f"Downloading {dl_item.filename}: {_format_bytes(received)}")
 
-    def _download_finished(self, dl_item: DownloadItem):
-        dl_item.status = "Complete"
-        self._status_label.setText(f"Download complete: {dl_item.filename}")
+    def _download_finished(self, dl_item: DownloadItem, download=None):
+        status = "Complete"
+        try:
+            if download is not None:
+                state = download.state()
+                name = getattr(state, "name", str(state))
+                if "Cancel" in name:
+                    status = "Cancelled"
+                elif "Interrupt" in name:
+                    status = "Interrupted"
+        except Exception:
+            pass
+        dl_item.status = status
+        if status == "Complete":
+            self._status_label.setText(f"Download complete: {dl_item.filename}")
+        else:
+            self._status_label.setText(f"Download {status.lower()}: {dl_item.filename}")
+        self._refresh_dl_button()
+        _save_downloads(self._downloads)
+        if self._dl_popup and self._dl_popup.isVisible():
+            self._dl_popup.refresh()
+
+    def _refresh_dl_button(self):
+        active = sum(1 for d in self._downloads if d.status == "Downloading")
+        if active:
+            self._dl_btn.setText(f"\u2913 {active}")
+            self._dl_btn.setToolTip(f"Downloads — {active} in progress")
+        else:
+            self._dl_btn.setText("\u2913")
+            self._dl_btn.setToolTip("Downloads")
+
+    def _toggle_downloads_popup(self):
+        if self._dl_popup and self._dl_popup.isVisible():
+            self._dl_popup.hide()
+            return
+        if self._dl_popup is None:
+            self._dl_popup = DownloadsPopup(self)
+        pos = self._dl_btn.mapToGlobal(QPoint(self._dl_btn.width() - 380, self._dl_btn.height()))
+        if pos.x() < 8:
+            pos.setX(8)
+        self._dl_popup.popup_at(pos)
 
     def _show_downloads(self):
-        """Show download manager dialog (#12)."""
-        dlg = DownloadManagerDialog(self._downloads, self)
-        dlg.exec()
+        self._toggle_downloads_popup()
 
     def _inject_ad_hider(self, page):
         """Inject ad blocking scripts — matches Ceprkac's InjectAdElementHider + InjectMainWorldBlocker."""
@@ -3067,7 +3518,7 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.7")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.8")
     except Exception:
         pass
 
