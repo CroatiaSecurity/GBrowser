@@ -38,7 +38,7 @@ Originally written in C# as **Ceprkac**, the browser has been fully ported to Py
 - **Custom blocklist support** — load additional domains from `blocklist.txt`
 - **Whitelist system** — banking, auth, AI services, gaming platforms, and other essential sites are never blocked
 - **No full-page overlay scrubber** — aggressive overlay hiding was removed so login and video pages stay visible
-- **Injected-module cleaner** — unloads every DLL that is not GBrowser's own tree or a Windows system directory (overlays, injectors, sideloads) from this process and QtWebEngine children
+- **Injected-module cleaner** — the moment a DLL is mapped that is not under GBrowser's own tree, it is unloaded from this process and every child process (not from the rest of the system)
 
 ### 🔐 Password Manager
 - **Encrypted credential storage** — uses Windows DPAPI on Windows, Fernet (AES-128) fallback on other platforms
