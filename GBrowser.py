@@ -1,18 +1,20 @@
 # GBROWSER 2025 — Full-featured Python browser (ported from Ceprkac C#)
-# Python 3.13 + PyQt6 + PyQt6-WebEngine compatible
+# Python 3.13 + PyQt6 + PyQt6-WebEngine
 # Logic-matched to Ceprkac: OAuth popups, downloads, custom tab strip, auth callbacks
 import sys
 import os
 
-# Chromium reads this once, at the first QtWebEngine import. Setting it later
-# (in __main__) is too late and Google still sees the QtWebEngine Client Hint
-# → "This browser or app may not be secure".
+# Chromium reads this once, at the first QtWebEngine import.
+# Do NOT hide QtWebEngine from the UA / Client Hints. Google rejects a
+# Chrome or Firefox disguise from this engine ("browser may not be secure")
+# but accepts the honest Qt identity (as in 5.4).
 _flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-if "UserAgentClientHint" not in _flags:
+if "AutomationControlled" not in _flags:
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-        f"{_flags} --disable-features=UserAgentClientHint,AutomationControlled,"
+        f"{_flags} --disable-features=AutomationControlled,"
         "WebAuthentication,WebAuthenticationCable,WebAuthenticationHybridTransport "
         "--disable-blink-features=AutomationControlled,WebAuthentication "
+        "--enable-features=PlatformHEVCDecoderSupport,PlatformHEVCEncoderSupport "
         "--enable-media-stream"
     ).strip()
 
@@ -26,7 +28,7 @@ from urllib.parse import urlparse, quote_plus
 from PyQt6.QtWidgets import *
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import *
-from PyQt6.QtCore import Qt, QUrl, QTimer, QByteArray, QPoint, QRect, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, QTimer, QPoint, QRect, QSize, pyqtSignal
 from PyQt6.QtGui import (QIcon, QPainter, QPixmap, QColor, QFont, QPen, QBrush,
                           QKeySequence, QShortcut, QPainterPath, QAction, QFontMetrics)
 
@@ -216,11 +218,12 @@ AD_BLOCK_WHITELIST: set[str] = {
     # adservice.google.com (parent-domain walk) and lets GPT ads through on
     # news sites. First-party requests on google.com are already allowed.
     "accounts.google.com","accounts.youtube.com","myaccount.google.com",
+    "signin.google.com","accounts.gstatic.com",
     "youtube.com","www.youtube.com",
     "login.microsoftonline.com","login.live.com","login.microsoft.com",
     "appleid.apple.com","idmsa.apple.com",
     "github.com","auth0.com","okta.com",
-    "apis.google.com","ssl.gstatic.com",
+    "apis.google.com","ssl.gstatic.com","oauth2.googleapis.com",
     "pay.google.com","payments.google.com",
     "redditstatic.com",
     "gog.com","auth.gog.com","login.gog.com",
@@ -259,10 +262,11 @@ AD_BLOCK_WHITELIST: set[str] = {
 
 # === OAuth/AUTH DOMAINS (Same as Ceprkac) ===
 AUTH_DOMAINS = [
-    "accounts.google.com", "/gsi/", "appleid.apple.com", "login.microsoftonline.com",
+    "accounts.google.com", "signin.google.com", "accounts.gstatic.com",
+    "/gsi/", "appleid.apple.com", "login.microsoftonline.com",
     "api.twitter.com", "twitter.com/i/oauth", "x.com/i/oauth", "/oauth", "/auth/",
     "/authorize", "/signin", "/sso", "pay.google.com", "payments.google.com",
-    "clerk.", "suno.com", "suno.ai"
+    "oauth2.googleapis.com", "clerk.", "suno.com", "suno.ai"
 ]
 
 def _is_auth_url(url: str) -> bool:
@@ -298,6 +302,7 @@ def _is_idp_challenge_url(url: str) -> bool:
         return False
     idp_hosts = (
         "accounts.google.com", "accounts.youtube.com",
+        "myaccount.google.com", "signin.google.com",
         "login.microsoftonline.com", "login.live.com", "login.microsoft.com",
         "appleid.apple.com", "idmsa.apple.com",
     )
@@ -890,6 +895,7 @@ class ChromeTab:
         self.last_autofill_attempt: float = 0
         self.zoom_factor: float = 1.0
         self.is_popup: bool = False
+        self.focus_omnibox: bool = False
 
 
 class ChromeTabStrip(QWidget):
@@ -1107,45 +1113,6 @@ class ChromeTabStrip(QWidget):
         self._drag_tab_index = -1
 
 
-def _chromium_major() -> str:
-    try:
-        from PyQt6.QtWebEngineCore import qWebEngineChromiumVersion
-        return (qWebEngineChromiumVersion() or "140").split(".")[0]
-    except Exception:
-        return "140"
-
-
-# qutebrowser #5182 / Falkon: Google rejects a Chrome UA from QtWebEngine
-# (it treats it as an embedded WebView). A Firefox UA skips that check.
-_FIREFOX_SIGNIN_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
-    "Gecko/20100101 Firefox/140.0"
-)
-_FIREFOX_SIGNIN_UA_BYTES = _FIREFOX_SIGNIN_UA.encode("ascii")
-
-
-def _is_google_signin_host(host: str) -> bool:
-    h = (host or "").lower()
-    return (
-        h == "accounts.google.com" or h.endswith(".accounts.google.com")
-        or h == "accounts.youtube.com"
-        or h == "myaccount.google.com"
-    )
-
-
-def _apply_google_signin_ua(info) -> None:
-    """Use a Firefox UA on Google Sign-In so QtWebEngine is not rejected."""
-    try:
-        info.setHttpHeader(QByteArray(b"User-Agent"), QByteArray(_FIREFOX_SIGNIN_UA_BYTES))
-        # Firefox does not send these; a Chrome brand + Firefox UA is worse.
-        info.setHttpHeader(QByteArray(b"Sec-CH-UA"), QByteArray(b""))
-        info.setHttpHeader(QByteArray(b"Sec-CH-UA-Mobile"), QByteArray(b""))
-        info.setHttpHeader(QByteArray(b"Sec-CH-UA-Platform"), QByteArray(b""))
-        info.setHttpHeader(QByteArray(b"Sec-CH-UA-Full-Version-List"), QByteArray(b""))
-    except Exception:
-        pass
-
-
 # === AD BLOCKER INTERCEPTOR (Same logic as Ceprkac) ===
 class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
     def __init__(self):
@@ -1160,9 +1127,6 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
                 first_party_host = first_party_url.host().lower()
 
             host = info.requestUrl().host().lower()
-
-            if _is_google_signin_host(host) or _is_google_signin_host(first_party_host):
-                _apply_google_signin_ua(info)
 
             # Never cancel a top-level navigation. Blocking the main document
             # leaves the user on the previous page (usually the homepage).
@@ -1777,6 +1741,8 @@ class DownloadItem:
         self.received = 0
         self.total = 0
         self.status = "Downloading"
+        self._request = None  # keep QWebEngineDownloadRequest alive
+        self._finalized = False
 
     def to_dict(self) -> dict:
         return {
@@ -2039,47 +2005,6 @@ class DownloadsPopup(QFrame):
         self.refresh()
 
 
-# Hide Qt/automation fingerprints that Google Sign-In uses to reject the browser.
-CHROME_COMPAT_JS = r"""
-(function(){
-  try { Object.defineProperty(navigator,'webdriver',{get:function(){return undefined;},configurable:true}); } catch(e) {}
-  try {
-    if (!window.chrome) {
-      window.chrome = { runtime: {}, loadTimes: function(){return {};}, csi: function(){return {};},
-                        app: { isInstalled: false } };
-    }
-  } catch(e) {}
-  try {
-    var brands = [
-      {brand: "Chromium", version: "131"},
-      {brand: "Google Chrome", version: "131"},
-      {brand: "Not_A Brand", version: "24"}
-    ];
-    var uaData = {
-      brands: brands,
-      mobile: false,
-      platform: "Windows",
-      getHighEntropyValues: function(hints) {
-        return Promise.resolve({
-          brands: brands,
-          mobile: false,
-          platform: "Windows",
-          platformVersion: "15.0.0",
-          architecture: "x86",
-          bitness: "64",
-          model: "",
-          uaFullVersion: "131.0.0.0",
-          fullVersionList: brands
-        });
-      },
-      toJSON: function(){ return {brands: brands, mobile: false, platform: "Windows"}; }
-    };
-    Object.defineProperty(navigator, 'userAgentData', {get: function(){return uaData;}, configurable: true});
-  } catch(e) {}
-})();
-"""
-
-
 # Kill passkey / WebAuthn prompts on every site (Google, Microsoft, GitHub, …).
 DISABLE_PASSKEY_JS = r"""
 (function(){
@@ -2139,7 +2064,7 @@ DISABLE_PASSKEY_JS = r"""
 GSEC_SLOT_COLLAPSE_JS = r"""
 (function(){
   var h=(location.hostname||'').toLowerCase();
-  if(/accounts\.google|accounts\.youtube|appleid\.apple|login\.microsoft|login\.live/.test(h))return;
+  if(/accounts\.google|accounts\.youtube|myaccount\.google|signin\.google|accounts\.gstatic|appleid\.apple|login\.microsoft|login\.live/.test(h))return;
   if(window.__gsecSlotCollapse)return;window.__gsecSlotCollapse=1;
   var css=document.createElement('style');
   css.textContent=[
@@ -2199,21 +2124,9 @@ class Browser(QMainWindow):
         self._downloads: list[DownloadItem] = _load_downloads()
         self._dl_popup: DownloadsPopup | None = None
         self._profile = QWebEngineProfile("GBrowserProfile", self)
-        # Real Chromium version, no QtWebEngine token. Combined with
-        # QTWEBENGINE_CHROMIUM_FLAGS (set before import) and spoofed
-        # Sec-CH-UA headers so Google does not reject the browser.
-        try:
-            raw_ua = QWebEngineProfile.defaultProfile().httpUserAgent() or ""
-            ua = re.sub(r"\s*QtWebEngine/\S+", "", raw_ua).strip()
-            ver = _chromium_major()
-            if not ua or "Chrome/" not in ua:
-                ua = (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
-                )
-            self._profile.setHttpUserAgent(ua)
-        except Exception:
-            pass
+        # Keep the stock QtWebEngine user-agent (includes the QtWebEngine/x.y
+        # token and Client Hints). Spoofing Chrome or Firefox is what made
+        # Google Sign-In fail after 5.4.
         self._profile.setPersistentStoragePath(os.path.join(CONFIG_DIR, "storage"))
         self._profile.setCachePath(os.path.join(CONFIG_DIR, "cache"))
         self._profile.setPersistentCookiesPolicy(
@@ -2243,7 +2156,7 @@ class Browser(QMainWindow):
             pass
         self._profile.setUrlRequestInterceptor(self._ad_blocker)
         self._profile.downloadRequested.connect(self._on_download_requested)
-        self._install_chrome_compat_script()
+        self._install_passkey_script()
 
         self._gsec_dir = _find_gsecurity_dir()
         _load_blocklist_file(_resource_path("blocklist.txt"))
@@ -2449,7 +2362,7 @@ class Browser(QMainWindow):
         # Shortcuts
         QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(lambda: self._add_new_tab(self._home_url))
         QShortcut(QKeySequence("Ctrl+W"), self).activated.connect(self._close_current_tab)
-        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._address.setFocus)
+        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._focus_address_bar)
         QShortcut(QKeySequence("Ctrl+D"), self).activated.connect(self._toggle_bookmark)
         QShortcut(QKeySequence("Ctrl+I"), self).activated.connect(self._open_devtools)
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self._toggle_find_bar)
@@ -2628,7 +2541,21 @@ class Browser(QMainWindow):
 
         if load_url:
             tab.web_view.load(_to_qurl(tab.url))
+        # User-created tabs: put the caret in the address bar so typing
+        # starts immediately (Chrome omnibox). OAuth popups keep page focus.
+        if load_url and not tab.is_popup:
+            tab.focus_omnibox = True
+            # Don't let the web view steal keys until the user clicks the page.
+            tab.web_view.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+            self._address.setText(tab.url)
+            self._focus_address_bar()
+            QTimer.singleShot(0, self._focus_address_bar)
         return tab
+
+    def _focus_address_bar(self):
+        """Focus the address bar and select its text so the next key replaces it."""
+        self._address.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._address.selectAll()
 
     def _on_tab_clicked(self, index: int):
         if 0 <= index < len(self._tabs):
@@ -2642,6 +2569,10 @@ class Browser(QMainWindow):
             if tab.web_view:
                 tab.web_view.setZoomFactor(tab.zoom_factor)
             self._update_zoom_status()
+            if tab.focus_omnibox:
+                self._focus_address_bar()
+            elif tab.web_view:
+                tab.web_view.setFocus()
 
     def _on_tab_close_clicked(self, index: int):
         self._close_tab(index)
@@ -2680,7 +2611,12 @@ class Browser(QMainWindow):
         tab.load_progress = 0
         self._tab_strip.update()
         if tab == self._active_tab():
-            self._status_label.setText("Loading...")
+            if not any(d.status == "Downloading" and not d._finalized for d in self._downloads):
+                self._status_label.setText("Loading...")
+            # Reclaim keys if the web view stole them, but don't selectAll
+            # over characters the user already typed.
+            if tab.focus_omnibox and not self._address.hasFocus():
+                self._focus_address_bar()
 
     def _on_load_finished(self, tab: ChromeTab, ok: bool):
         tab.is_loading = False
@@ -2688,7 +2624,8 @@ class Browser(QMainWindow):
         idx = self._tabs.index(tab) if tab in self._tabs else -1
         if idx >= 0:
             self._tab_strip.set_tab_text(idx, tab.title[:25] if tab.title else "New Tab")
-        self._update_ad_block_status()
+        if not any(d.status == "Downloading" and not d._finalized for d in self._downloads):
+            self._update_ad_block_status()
         self._add_to_history(tab.url)
         self._try_autofill(tab)
 
@@ -2828,15 +2765,8 @@ class Browser(QMainWindow):
         self._store_media_decision(origin, choice)
         self._apply_media_result(permission, legacy, True)
 
-    def _install_chrome_compat_script(self):
-        """Inject Chrome-like globals before any page script runs."""
-        self._install_script(
-            "gbrowser-chrome-compat",
-            CHROME_COMPAT_JS,
-            QWebEngineScript.ScriptWorldId.MainWorld,
-            QWebEngineScript.InjectionPoint.DocumentCreation,
-            True,
-        )
+    def _install_passkey_script(self):
+        """Dismiss WebAuthn/passkey prompts; do not spoof browser identity."""
         self._install_script(
             "gbrowser-no-passkey",
             DISABLE_PASSKEY_JS,
@@ -2852,7 +2782,8 @@ class Browser(QMainWindow):
         # Never run Shield scripts on IdP hosts — they break Google Sign-In.
         auth_prefix = (
             "(function(){var h=(location.hostname||'').toLowerCase();"
-            "if(/accounts\\.google|accounts\\.youtube|myaccount\\.google|appleid\\.apple|"
+            "if(/accounts\\.google|accounts\\.youtube|myaccount\\.google|signin\\.google|"
+            "accounts\\.gstatic|appleid\\.apple|"
             "login\\.microsoft|login\\.live|idmsa\\.apple/.test(h))return;\n"
         )
         auth_suffix = "\n})();"
@@ -2922,30 +2853,124 @@ class Browser(QMainWindow):
         if not path:
             download.cancel()
             return
-        download.setDownloadFileName(path)
+        directory, filename = os.path.split(path)
+        if hasattr(download, "setDownloadDirectory") and directory:
+            download.setDownloadDirectory(directory)
+            download.setDownloadFileName(filename)
+        else:
+            download.setDownloadFileName(path)
         download.accept()
         url = ""
         try:
             url = download.url().toString()
         except Exception:
             pass
-        dl_item = DownloadItem(os.path.basename(path), path, url)
+        dl_item = DownloadItem(filename or os.path.basename(path), path, url)
+        # Must keep the Qt download object alive. If Python GCs the wrapper,
+        # progress/finished signals never fire and the UI stays on "Downloading".
+        dl_item._request = download
         self._downloads.append(dl_item)
         if len(self._downloads) > 40:
             self._downloads = self._downloads[-40:]
         self._status_label.setText(f"Downloading {dl_item.filename}…")
         self._refresh_dl_button()
-        download.downloadProgress.connect(
-            lambda received, total, item=dl_item: self._update_download_status(received, total, item))
-        download.finished.connect(lambda item=dl_item, req=download: self._download_finished(item, req))
+        self._wire_download(download, dl_item)
         if self._dl_popup and self._dl_popup.isVisible():
             self._dl_popup.refresh()
 
+    def _wire_download(self, download, dl_item: DownloadItem):
+        """Connect Qt5 and Qt6 download signals; poll as a fallback."""
+        if hasattr(download, "downloadProgress"):
+            download.downloadProgress.connect(
+                lambda received, total, item=dl_item: self._update_download_status(received, total, item))
+        def _sync_bytes(item=dl_item, req=download):
+            try:
+                recv = int(req.receivedBytes())
+            except Exception:
+                recv = item.received
+            try:
+                total = int(req.totalBytes())
+            except Exception:
+                total = item.total
+            self._update_download_status(recv, total, item)
+        if hasattr(download, "receivedBytesChanged"):
+            download.receivedBytesChanged.connect(_sync_bytes)
+        if hasattr(download, "totalBytesChanged"):
+            download.totalBytesChanged.connect(_sync_bytes)
+        if hasattr(download, "finished"):
+            download.finished.connect(
+                lambda item=dl_item, req=download: self._download_finished(item, req))
+        if hasattr(download, "isFinishedChanged"):
+            download.isFinishedChanged.connect(
+                lambda item=dl_item, req=download: self._apply_download_state(item, req))
+        if hasattr(download, "stateChanged"):
+            download.stateChanged.connect(
+                lambda *_args, item=dl_item, req=download: self._apply_download_state(item, req))
+        QTimer.singleShot(0, lambda item=dl_item, req=download: self._apply_download_state(item, req))
+        QTimer.singleShot(400, lambda item=dl_item, req=download: self._poll_download(item, req))
+
+    def _poll_download(self, dl_item: DownloadItem, download):
+        if dl_item._finalized:
+            return
+        self._apply_download_state(dl_item, download)
+        if not dl_item._finalized:
+            QTimer.singleShot(400, lambda item=dl_item, req=download: self._poll_download(item, req))
+
+    def _apply_download_state(self, dl_item: DownloadItem, download=None):
+        if dl_item._finalized:
+            return
+        req = download if download is not None else dl_item._request
+        try:
+            if req is not None:
+                if hasattr(req, "receivedBytes"):
+                    dl_item.received = int(req.receivedBytes())
+                if hasattr(req, "totalBytes"):
+                    dl_item.total = int(req.totalBytes())
+        except Exception:
+            pass
+        name = ""
+        finished = False
+        try:
+            if req is not None:
+                state = req.state()
+                name = getattr(state, "name", str(state))
+                fin = getattr(req, "isFinished", None)
+                if callable(fin):
+                    finished = bool(fin())
+                elif isinstance(fin, bool):
+                    finished = fin
+        except Exception:
+            pass
+        if "Cancel" in name:
+            self._download_finished(dl_item, req)
+            return
+        if "Interrupt" in name:
+            self._download_finished(dl_item, req)
+            return
+        if "Completed" in name or "Complete" in name:
+            self._download_finished(dl_item, req)
+            return
+        if finished and "Progress" not in name and "Requested" not in name:
+            self._download_finished(dl_item, req)
+            return
+        # File is fully on disk but Qt never sent a completion signal.
+        try:
+            if (dl_item.total > 0 and dl_item.received >= dl_item.total
+                    and dl_item.path and os.path.isfile(dl_item.path)
+                    and os.path.getsize(dl_item.path) >= dl_item.total):
+                self._download_finished(dl_item, req)
+                return
+        except Exception:
+            pass
+        self._update_download_status(dl_item.received, dl_item.total, dl_item)
+
     def _update_download_status(self, received: int, total: int, dl_item: DownloadItem):
+        if dl_item._finalized or dl_item.status != "Downloading":
+            return
         dl_item.received = received
         dl_item.total = total
         if total > 0:
-            pct = int(received * 100 / total)
+            pct = min(100, int(received * 100 / total))
             self._status_label.setText(
                 f"Downloading {dl_item.filename}: {_format_bytes(received)} / {_format_bytes(total)} ({pct}%)")
             self._dl_btn.setToolTip(f"Downloads — {dl_item.filename} {pct}%")
@@ -2954,10 +2979,13 @@ class Browser(QMainWindow):
                 f"Downloading {dl_item.filename}: {_format_bytes(received)}")
 
     def _download_finished(self, dl_item: DownloadItem, download=None):
+        if dl_item._finalized:
+            return
         status = "Complete"
+        req = download if download is not None else dl_item._request
         try:
-            if download is not None:
-                state = download.state()
+            if req is not None:
+                state = req.state()
                 name = getattr(state, "name", str(state))
                 if "Cancel" in name:
                     status = "Cancelled"
@@ -2965,7 +2993,21 @@ class Browser(QMainWindow):
                     status = "Interrupted"
         except Exception:
             pass
+        if status == "Complete" and req is not None:
+            try:
+                if hasattr(req, "receivedBytes"):
+                    dl_item.received = int(req.receivedBytes()) or dl_item.received
+                if hasattr(req, "totalBytes"):
+                    total = int(req.totalBytes())
+                    if total > 0:
+                        dl_item.total = total
+            except Exception:
+                pass
+            if dl_item.total <= 0 and dl_item.received > 0:
+                dl_item.total = dl_item.received
         dl_item.status = status
+        dl_item._finalized = True
+        dl_item._request = None
         if status == "Complete":
             self._status_label.setText(f"Download complete: {dl_item.filename}")
         else:
@@ -3430,6 +3472,8 @@ class Browser(QMainWindow):
                 url = self._search_template.format(quote_plus(text))
         tab = self._active_tab()
         if tab and tab.web_view:
+            tab.focus_omnibox = False
+            tab.web_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             tab.url = url
             tab.web_view.load(_to_qurl(url))
 
@@ -3518,7 +3562,7 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.8")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.9")
     except Exception:
         pass
 

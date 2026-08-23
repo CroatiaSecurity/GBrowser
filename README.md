@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.8-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-5.9-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.13+-green?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/engine-Chromium%20(QtWebEngine)-orange?style=flat-square" alt="Engine">
   <img src="https://img.shields.io/badge/license-proprietary-red?style=flat-square" alt="License">
@@ -69,7 +69,7 @@ Originally written in C# as **Ceprkac**, the browser has been fully ported to Py
 - **Zoom controls** — `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0`
 
 ### 🔑 OAuth & Authentication
-- **Google Sign-In** — uses a Firefox user-agent only on Google account hosts so Qt WebEngine is not rejected as an insecure app
+- **Google Sign-In** — keeps the real Qt WebEngine user-agent (as in 5.4). Pretending to be Chrome or Firefox is what Google flags as unsafe
 - **OAuth popups** — Google / Reddit and other `window.open` login flows load in a real tab so `window.opener` stays intact
 - **Passkeys off** — WebAuthn/passkey prompts are disabled in the engine and dismissed in the page
 - **Camera and microphone** — Chrome-style prompt: pick a device and allow this time, this visit, or always
@@ -140,7 +140,7 @@ build.bat
 This will:
 1. Install dependencies
 2. Build with PyInstaller (`--onedir --windowed`)
-3. Package with Inno Setup into `releases/5.8/GBrowser-5.8-Setup.exe`
+3. Package with Inno Setup into `releases/5.9/GBrowser-5.9-Setup.exe`
 
 > ⚙️ Requires [PyInstaller](https://pyinstaller.org/) and [Inno Setup 7](https://jrsoftware.org/isinfo.php) to be installed.
 
