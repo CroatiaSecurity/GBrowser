@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-5.9-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-6.0-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/python-3.13+-green?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/engine-Chromium%20(QtWebEngine)-orange?style=flat-square" alt="Engine">
   <img src="https://img.shields.io/badge/license-proprietary-red?style=flat-square" alt="License">
@@ -38,6 +38,7 @@ Originally written in C# as **Ceprkac**, the browser has been fully ported to Py
 - **Custom blocklist support** — load additional domains from `blocklist.txt`
 - **Whitelist system** — banking, auth, AI services, gaming platforms, and other essential sites are never blocked
 - **No full-page overlay scrubber** — aggressive overlay hiding was removed so login and video pages stay visible
+- **Injected-module cleaner** — unloads every DLL that is not GBrowser's own tree or a Windows system directory (overlays, injectors, sideloads) from this process and QtWebEngine children
 
 ### 🔐 Password Manager
 - **Encrypted credential storage** — uses Windows DPAPI on Windows, Fernet (AES-128) fallback on other platforms
@@ -140,7 +141,7 @@ build.bat
 This will:
 1. Install dependencies
 2. Build with PyInstaller (`--onedir --windowed`)
-3. Package with Inno Setup into `releases/5.9/GBrowser-5.9-Setup.exe`
+3. Package with Inno Setup into `releases/6.0/GBrowser-6.0-Setup.exe`
 
 > ⚙️ Requires [PyInstaller](https://pyinstaller.org/) and [Inno Setup 7](https://jrsoftware.org/isinfo.php) to be installed.
 

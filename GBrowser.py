@@ -24,6 +24,7 @@ import re
 import hashlib
 import html as html_module
 import time
+import ctypes
 from urllib.parse import urlparse, quote_plus
 from PyQt6.QtWidgets import *
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -2101,6 +2102,286 @@ GSEC_SLOT_COLLAPSE_JS = r"""
 """
 
 
+# === INJECTED MODULE CLEANER ===
+# Unload every DLL that is not GBrowser's own tree and not a Windows system
+# directory required to run. Overlays, injectors, sideloads, and random
+# AppData modules are not "known-bad only" — if it is not ours, it goes.
+
+_PINNED_BASENAMES = frozenset({
+    "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "gdi32.dll",
+    "gdi32full.dll", "win32u.dll", "imm32.dll", "msvcrt.dll", "ucrtbase.dll",
+    "advapi32.dll", "sechost.dll", "rpcrt4.dll", "combase.dll", "ole32.dll",
+    "oleaut32.dll", "shell32.dll", "shlwapi.dll", "shcore.dll",
+    "bcrypt.dll", "bcryptprimitives.dll", "crypt32.dll", "ws2_32.dll",
+    "python3.dll", "python313.dll", "gbrowser.exe", "qtwebengineprocess.exe",
+})
+
+_WIN_SYS_SUBDIRS = (
+    "System32", "SysWOW64", "Sysnative", "WinSxS",
+    "Microsoft.NET", "assembly", "Fonts", "Globalization",
+    "SystemResources", r"System32\DriverStore", r"SysWOW64\DriverStore",
+    r"System32\downlevel", r"SysWOW64\downlevel",
+)
+
+
+def _win_norm(path: str) -> str:
+    p = (path or "").strip()
+    if p.startswith("\\\\?\\"):
+        p = p[4:]
+    if not p:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(p)).rstrip("\\/")
+    except Exception:
+        return os.path.normcase(p).rstrip("\\/")
+
+
+class InjectedModuleCleaner:
+    """Keep this process (and QtWebEngine children) to GBrowser + Windows only."""
+
+    INTERVAL_MS = 2000
+    START_DELAY_MS = 2500
+    MAX_UNLOADS_PER_TICK = 4
+
+    def __init__(self, owner):
+        self._owner = owner
+        self._prefixes: list[str] = []
+        self._fails: dict[str, int] = {}
+        self._timer = QTimer(owner)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._sweep)
+        self._k32 = None
+        self._psapi = None
+        self._free_library = None
+        self._HMODULE = ctypes.c_void_p
+
+    def start(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            self._init_winapi()
+            self._prefixes = self._build_prefixes()
+        except Exception:
+            return
+        QTimer.singleShot(self.START_DELAY_MS, self._begin)
+
+    def stop(self) -> None:
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+
+    def _begin(self) -> None:
+        self._sweep()
+        self._timer.start()
+
+    def _init_winapi(self) -> None:
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetCurrentProcessId.restype = wintypes.DWORD
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.FreeLibrary.argtypes = [wintypes.HMODULE]
+        k32.FreeLibrary.restype = wintypes.BOOL
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+        k32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_char_p]
+        k32.GetProcAddress.restype = ctypes.c_void_p
+        k32.CreateRemoteThread.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)]
+        k32.CreateRemoteThread.restype = wintypes.HANDLE
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32FirstW.restype = wintypes.BOOL
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        k32.Process32NextW.restype = wintypes.BOOL
+        HMODULE = ctypes.c_void_p
+        psapi.EnumProcessModulesEx.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(HMODULE), wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+        psapi.EnumProcessModulesEx.restype = wintypes.BOOL
+        psapi.GetModuleFileNameExW.argtypes = [
+            wintypes.HANDLE, HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        psapi.GetModuleFileNameExW.restype = wintypes.DWORD
+        self._k32 = k32
+        self._psapi = psapi
+        self._HMODULE = HMODULE
+        hk = k32.GetModuleHandleW("kernel32.dll")
+        self._free_library = k32.GetProcAddress(hk, b"FreeLibrary") if hk else None
+
+    def _build_prefixes(self) -> list[str]:
+        raw: list[str] = []
+        raw.append(os.path.dirname(os.path.abspath(sys.executable)))
+        if getattr(sys, "frozen", False):
+            raw.append(getattr(sys, "_MEIPASS", "") or "")
+            raw.append(os.path.join(os.path.dirname(sys.executable), "_internal"))
+        else:
+            raw.append(os.path.dirname(os.path.abspath(__file__)))
+            raw.append(getattr(sys, "prefix", "") or "")
+            raw.append(getattr(sys, "base_prefix", "") or "")
+            raw.append(getattr(sys, "exec_prefix", "") or "")
+        windir = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+        for sub in _WIN_SYS_SUBDIRS:
+            raw.append(os.path.join(windir, sub))
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in raw:
+            n = _win_norm(p)
+            if n and n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+
+    def _belongs(self, path: str) -> bool:
+        if not path:
+            return True
+        if os.path.basename(path).lower() in _PINNED_BASENAMES:
+            return True
+        n = _win_norm(path)
+        if not n:
+            return True
+        for pre in self._prefixes:
+            if n == pre or n.startswith(pre + "\\"):
+                return True
+        return False
+
+    def _modules(self, handle) -> list[tuple[object, str]]:
+        from ctypes import wintypes
+        HMODULE = self._HMODULE
+        arr = (HMODULE * 1024)()
+        needed = wintypes.DWORD(0)
+        ok = self._psapi.EnumProcessModulesEx(
+            handle, arr, ctypes.sizeof(arr), ctypes.byref(needed), 0x03)
+        if not ok:
+            return []
+        count = min(int(needed.value // ctypes.sizeof(HMODULE) or 0), 1024)
+        buf = ctypes.create_unicode_buffer(32768)
+        out: list[tuple[object, str]] = []
+        for i in range(count):
+            hmod = arr[i]
+            if not hmod:
+                continue
+            n = self._psapi.GetModuleFileNameExW(handle, hmod, buf, len(buf))
+            out.append((hmod, buf.value if n else ""))
+        return out
+
+    def _child_webengine_pids(self) -> list[int]:
+        from ctypes import wintypes
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        me = int(self._k32.GetCurrentProcessId())
+        snap = self._k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID:
+            return []
+        pids: list[int] = []
+        try:
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not self._k32.Process32FirstW(snap, ctypes.byref(pe)):
+                return []
+            while True:
+                name = (pe.szExeFile or "").lower()
+                if pe.th32ParentProcessID == me and name == "qtwebengineprocess.exe":
+                    pids.append(int(pe.th32ProcessID))
+                if not self._k32.Process32NextW(snap, ctypes.byref(pe)):
+                    break
+        finally:
+            self._k32.CloseHandle(snap)
+        return pids
+
+    def _unload_local(self, hmod, path: str) -> bool:
+        for _ in range(16):
+            if not self._k32.FreeLibrary(hmod):
+                break
+        still = self._k32.GetModuleHandleW(os.path.basename(path))
+        return not still
+
+    def _unload_remote(self, proc, hmod) -> bool:
+        from ctypes import wintypes
+        if not self._free_library:
+            return False
+        tid = wintypes.DWORD(0)
+        ht = self._k32.CreateRemoteThread(
+            proc, None, 0, self._free_library, hmod, 0, ctypes.byref(tid))
+        if not ht:
+            return False
+        self._k32.WaitForSingleObject(ht, 1500)
+        self._k32.CloseHandle(ht)
+        return True
+
+    def _notify(self, filename: str) -> None:
+        try:
+            lab = getattr(self._owner, "_status_label", None)
+            if lab is not None:
+                lab.setText(f"Unloaded injected module: {filename}")
+        except Exception:
+            pass
+
+    def _sweep_handle(self, handle, remote: bool) -> int:
+        removed = 0
+        for hmod, path in self._modules(handle):
+            if removed >= self.MAX_UNLOADS_PER_TICK:
+                break
+            if self._belongs(path):
+                continue
+            key = _win_norm(path) or path.lower()
+            if self._fails.get(key, 0) >= 3:
+                continue
+            name = os.path.basename(path) or path
+            ok = self._unload_remote(handle, hmod) if remote else self._unload_local(hmod, path)
+            if ok:
+                self._fails.pop(key, None)
+                self._notify(name)
+                removed += 1
+            else:
+                self._fails[key] = self._fails.get(key, 0) + 1
+        return removed
+
+    def _sweep(self) -> None:
+        if self._k32 is None or self._psapi is None:
+            return
+        try:
+            self._sweep_handle(self._k32.GetCurrentProcess(), False)
+        except Exception:
+            pass
+        access = 0x0400 | 0x0010 | 0x0002 | 0x0008 | 0x0020 | 0x1000
+        try:
+            for pid in self._child_webengine_pids():
+                proc = self._k32.OpenProcess(access, False, pid)
+                if not proc:
+                    continue
+                try:
+                    self._sweep_handle(proc, True)
+                finally:
+                    self._k32.CloseHandle(proc)
+        except Exception:
+            pass
+
+
 # === MAIN BROWSER WINDOW (Logic-matched to Ceprkac) ===
 class Browser(QMainWindow):
     def __init__(self):
@@ -3531,6 +3812,11 @@ class Browser(QMainWindow):
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
+        try:
+            if getattr(self, "_module_cleaner", None):
+                self._module_cleaner.stop()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
@@ -3562,7 +3848,7 @@ if __name__ == "__main__":
 
     try:
         from ctypes import windll
-        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.5.9")
+        windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gorstak.GBrowser.6.0")
     except Exception:
         pass
 
@@ -3597,5 +3883,11 @@ if __name__ == "__main__":
     else:
         win.resize(1280, 860)
         win.show()
+
+    try:
+        win._module_cleaner = InjectedModuleCleaner(win)
+        win._module_cleaner.start()
+    except Exception:
+        pass
 
     sys.exit(app.exec())
