@@ -25,7 +25,7 @@ GBrowser is a lightweight desktop web browser with a strong focus on **ad blocki
 
 Originally written in C# as **Ceprkac**, the browser has been fully ported to Python 3.13 using PyQt6 and PyQt6-WebEngine, keeping feature parity with the original while gaining the flexibility of the Python ecosystem.
 
-> **Need H.264 / AAC (Discord embeds, many HTML5 players) on Windows?** Use [Ceprkac 0.6.9](https://github.com/CroatiaSecurity/Ceprkac) — the WebView2 edition. GBrowser's shipped Qt WebEngine does not include MPEG-LA proprietary codecs.
+> **Need H.264 / AAC (Discord embeds, many HTML5 players) on Windows?** Use [Ceprkac 0.6.10](https://github.com/CroatiaSecurity/Ceprkac) — the WebView2 edition. GBrowser's shipped Qt WebEngine does not include MPEG-LA proprietary codecs.
 
 ---
 
